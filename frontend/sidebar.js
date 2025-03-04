@@ -7,18 +7,20 @@ const AVAILABLE_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1
 // Initialize state
 let state = {
     messages: [],
-    selectedModel: 'gemini-2.0-flash'  // Default to flash model
+    selectedModel: 'gemini-2.0-flash',  // Default to flash model
+    fileSuggestions: [],
+    showingSuggestions: false
 };
 
 // Try to load previous state
 const previousState = vscode.getState();
 if (previousState) {
-    // Ensure the loaded model is still valid
     state = {
         ...previousState,
         selectedModel: AVAILABLE_MODELS.includes(previousState.selectedModel) 
             ? previousState.selectedModel 
-            : 'gemini-2.0-flash'
+            : 'gemini-2.0-flash',
+        showingSuggestions: false
     };
 }
 
@@ -27,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const sendButton = document.getElementById('send-btn');
     const messagesContainer = document.getElementById('chat-messages');
     const modelSelector = document.getElementById('model-selector');
+    const fileSuggestionsContainer = document.getElementById('file-suggestions');
 
     // Set initial model selection
     if (state.selectedModel) {
@@ -39,8 +42,52 @@ document.addEventListener('DOMContentLoaded', () => {
             state.selectedModel = e.target.value;
             vscode.setState(state);
         } else {
-            // Reset to default if invalid model selected
             e.target.value = state.selectedModel;
+        }
+    });
+
+    // Handle input changes for @ mentions and commands
+    chatInput.addEventListener('input', (e) => {
+        const text = e.target.value;
+        const cursorPosition = e.target.selectionStart;
+        const textBeforeCursor = text.substring(0, cursorPosition);
+        
+        // Handle @ mentions
+        if (textBeforeCursor.includes('@')) {
+            const lastAtSymbol = textBeforeCursor.lastIndexOf('@');
+            const query = textBeforeCursor.substring(lastAtSymbol + 1);
+            
+            if (query) {
+                // Request file suggestions from extension
+                vscode.postMessage({
+                    command: 'getFileSuggestions',
+                    query: query
+                });
+            }
+        } else {
+            hideSuggestions();
+        }
+
+        // Auto-resize textarea
+        chatInput.style.height = 'auto';
+        chatInput.style.height = chatInput.scrollHeight + 'px';
+    });
+
+    // Handle key commands
+    chatInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        } else if (e.key === 'Enter' && e.shiftKey) {
+            // Allow multiline input with Shift+Enter
+            return;
+        } else if (e.key === 'Tab' && state.showingSuggestions) {
+            e.preventDefault();
+            // Handle file suggestion completion
+            const selected = fileSuggestionsContainer.querySelector('.selected');
+            if (selected) {
+                insertFileSuggestion(selected.textContent);
+            }
         }
     });
 
@@ -50,14 +97,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // Handle send button click
     sendButton.addEventListener('click', sendMessage);
 
-    // Handle enter key
-    chatInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendMessage();
-        }
-    });
-
     // Handle message from extension
     window.addEventListener('message', event => {
         const message = event.data;
@@ -66,9 +105,45 @@ document.addEventListener('DOMContentLoaded', () => {
                 removeTypingIndicator();
                 addMessage('AI', message.text);
                 break;
+            case 'fileSuggestions':
+                showFileSuggestions(message.suggestions);
+                break;
         }
     });
 });
+
+function showFileSuggestions(suggestions) {
+    const container = document.getElementById('file-suggestions');
+    container.innerHTML = '';
+    
+    suggestions.forEach(suggestion => {
+        const div = document.createElement('div');
+        div.className = 'file-suggestion';
+        div.textContent = suggestion;
+        div.onclick = () => insertFileSuggestion(suggestion);
+        container.appendChild(div);
+    });
+    
+    container.style.display = suggestions.length ? 'block' : 'none';
+    state.showingSuggestions = suggestions.length > 0;
+}
+
+function hideSuggestions() {
+    const container = document.getElementById('file-suggestions');
+    container.style.display = 'none';
+    state.showingSuggestions = false;
+}
+
+function insertFileSuggestion(suggestion) {
+    const chatInput = document.getElementById('chat-input');
+    const text = chatInput.value;
+    const cursorPosition = chatInput.selectionStart;
+    const lastAtSymbol = text.lastIndexOf('@', cursorPosition);
+    
+    const newText = text.substring(0, lastAtSymbol) + '@' + suggestion + text.substring(cursorPosition);
+    chatInput.value = newText;
+    hideSuggestions();
+}
 
 function sendMessage() {
     const chatInput = document.getElementById('chat-input');
@@ -78,7 +153,6 @@ function sendMessage() {
         addMessage('User', text);
         showTypingIndicator();
         
-        // Send message to extension with selected model
         vscode.postMessage({
             command: 'ask',
             text: text,
@@ -86,6 +160,8 @@ function sendMessage() {
         });
         
         chatInput.value = '';
+        chatInput.style.height = 'auto';
+        hideSuggestions();
     }
 }
 
@@ -122,15 +198,36 @@ function renderMessage(message) {
     content.className = 'message-content';
     content.innerHTML = formatMessage(message.text);
     
+    // Add apply buttons to code blocks
+    content.querySelectorAll('.code-block').forEach(block => {
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        
+        const applyBtn = document.createElement('button');
+        applyBtn.textContent = 'Apply';
+        applyBtn.onclick = () => {
+            const code = block.querySelector('code').textContent;
+            vscode.postMessage({
+                command: 'applyCode',
+                code: code,
+                file: block.dataset.file
+            });
+        };
+        
+        actions.appendChild(applyBtn);
+        block.appendChild(actions);
+    });
+    
     messageElement.appendChild(header);
     messageElement.appendChild(content);
     messagesContainer.appendChild(messageElement);
 }
 
 function formatMessage(text) {
-    // Convert code blocks
-    text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
-        return `<pre><code class="language-${lang || ''}">${escapeHtml(code.trim())}</code></pre>`;
+    // Convert code blocks with file information
+    text = text.replace(/```(\w+)?\s*(?:\{file:\s*([^}]+)\})?\n([\s\S]*?)```/g, (_, lang, file, code) => {
+        const fileAttr = file ? `data-file="${escapeHtml(file)}"` : '';
+        return `<div class="code-block" ${fileAttr}><pre><code class="language-${lang || ''}">${escapeHtml(code.trim())}</code></pre></div>`;
     });
     
     // Convert inline code
