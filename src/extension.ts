@@ -5,6 +5,15 @@ import { ContextManager } from "./contextManager";
 import { Uri } from "vscode";
 import * as path from 'path';
 
+// Add type definitions at the top of the file
+interface ResponseBlock {
+    type: 'text' | 'code';
+    content?: string;
+    language?: string;
+    file?: string;
+    code?: string;
+}
+
 export function activate(context: vscode.ExtensionContext) {
     let chatPanel: vscode.WebviewPanel | undefined;
     const contextManager = new ContextManager();
@@ -62,7 +71,52 @@ export function activate(context: vscode.ExtensionContext) {
                             JSON.stringify(workspaceFiles),
                             message.model
                         );
-                        chatPanel?.webview.postMessage({ command: "response", text: response });
+
+                        // Process each block in the response
+                        for (const block of response as ResponseBlock[]) {
+                            if (block.type === 'code') {
+                                if (block.file && block.code) {
+                                    // If code block has a file specified, create/update the file
+                                    try {
+                                        await fileManager.updateFile(block.file, block.code);
+                                        chatPanel?.webview.postMessage({ 
+                                            command: "response", 
+                                            text: `Updated file: ${block.file}`
+                                        });
+                                    } catch (error) {
+                                        try {
+                                            await fileManager.createFile(block.file, block.code);
+                                            chatPanel?.webview.postMessage({ 
+                                                command: "response", 
+                                                text: `Created file: ${block.file}`
+                                            });
+                                        } catch (createError) {
+                                            chatPanel?.webview.postMessage({ 
+                                                command: "response", 
+                                                text: `Error handling file ${block.file}: ${error instanceof Error ? error.message : 'Unknown error'}`
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Send the formatted response
+                        const formattedResponse = (response as ResponseBlock[]).map(block => {
+                            if (block.type === 'text' && block.content) {
+                                return block.content;
+                            } else if (block.type === 'code') {
+                                const fileInfo = block.file ? ` {file: ${block.file}}` : '';
+                                const language = block.language || '';
+                                return `\`\`\`${language}${fileInfo}\n${block.code || ''}\n\`\`\``;
+                            }
+                            return '';
+                        }).join('\n\n');
+
+                        chatPanel?.webview.postMessage({ 
+                            command: "response", 
+                            text: formattedResponse 
+                        });
                         break;
 
                     case "getFileSuggestions":
@@ -74,21 +128,50 @@ export function activate(context: vscode.ExtensionContext) {
                         break;
 
                     case "applyCode":
-                        if (!message.file) {
-                            // Create new file with the code
-                            const fileName = `generated_${Date.now()}.${getFileExtension(message.code)}`;
-                            await fileManager.createFile(fileName, message.code);
-                            chatPanel?.webview.postMessage({ 
-                                command: "response", 
-                                text: `Created new file: ${fileName} with the code`
-                            });
-                        } else {
-                            // Update existing file
-                            await fileManager.updateFile(message.file, message.code);
-                            chatPanel?.webview.postMessage({ 
-                                command: "response", 
-                                text: `Updated file: ${message.file}`
-                            });
+                        if (message.code) {
+                            // Extract code from code block if present
+                            let codeToApply = message.code;
+                            const codeBlockMatch = message.code.match(/```(?:\w+)?\s*(?:{[^}]*})?\s*([\s\S]*?)```/);
+                            if (codeBlockMatch) {
+                                codeToApply = codeBlockMatch[1].trim();
+                                // Ensure proper line endings
+                                codeToApply = codeToApply.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                                if (!codeToApply.endsWith('\n')) {
+                                    codeToApply += '\n';
+                                }
+                            }
+
+                            try {
+                                if (!message.file) {
+                                    // Create new file with the code
+                                    const fileName = `generated_${Date.now()}.${getFileExtension(codeToApply)}`;
+                                    await fileManager.createFile(fileName, codeToApply);
+                                    chatPanel?.webview.postMessage({ 
+                                        command: "response", 
+                                        text: `Created new file: ${fileName}`
+                                    });
+                                } else {
+                                    // Try to update first, if fails then create
+                                    try {
+                                        await fileManager.updateFile(message.file, codeToApply);
+                                        chatPanel?.webview.postMessage({ 
+                                            command: "response", 
+                                            text: `Updated file: ${message.file}`
+                                        });
+                                    } catch (updateError) {
+                                        await fileManager.createFile(message.file, codeToApply);
+                                        chatPanel?.webview.postMessage({ 
+                                            command: "response", 
+                                            text: `Created file: ${message.file}`
+                                        });
+                                    }
+                                }
+                            } catch (error) {
+                                chatPanel?.webview.postMessage({ 
+                                    command: "response", 
+                                    text: `Error handling file operation: ${error instanceof Error ? error.message : 'Unknown error'}`
+                                });
+                            }
                         }
                         break;
                 }

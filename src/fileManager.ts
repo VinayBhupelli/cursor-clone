@@ -87,101 +87,85 @@ export class FileManager {
         }
     }
 
-    private normalizeLineEndings(content: string): string {
-        // First split by semicolons and braces to identify statement boundaries
-        let normalized = content;
-        
-        // Replace semicolons with semicolon + newline if not already followed by newline
-        normalized = normalized.replace(/;(?!\n)/g, ';\n');
-        
-        // Add newlines after opening braces if not already present
-        normalized = normalized.replace(/{(?!\n)/g, '{\n');
-        
-        // Add newlines before closing braces if not already present
-        normalized = normalized.replace(/(?!\n)}/g, '\n}');
-        
-        // Add newlines after closing braces if not followed by else, catch, etc
-        normalized = normalized.replace(/}(?!\n)(?!else|catch|finally|while)/g, '}\n');
-        
-        // Handle function declarations
-        normalized = normalized.replace(/\)\s*{/g, ') {\n');
-        
-        // Handle if conditions
-        normalized = normalized.replace(/if\s*\([^)]+\)\s*(?={)/g, match => `${match}\n`);
-        
-        // Handle for loops
-        normalized = normalized.replace(/for\s*\([^)]+\)\s*(?={)/g, match => `${match}\n`);
-        
-        // Handle includes and defines (for C/C++)
-        normalized = normalized.replace(/(#include\s*<[^>]+>|#define\s+[^\n]+)/g, '$1\n');
-        
-        // Convert all remaining line endings to \n
-        normalized = normalized.replace(/\r\n|\r/g, '\n');
-        
-        // Fix multiple consecutive line breaks
-        normalized = normalized.replace(/\n\s*\n\s*\n/g, '\n\n');
-        
-        // Apply indentation
-        normalized = this.formatCode(normalized);
-        
-        // Ensure content ends with a newline
-        if (!normalized.endsWith('\n')) {
-            normalized += '\n';
+    private getCodeContent(content: any): string {
+        console.log('=== Debug getCodeContent ===');
+        console.log('Content type:', typeof content);
+        console.log('Content:', content);
+
+        // If content is a code block object from Gemini
+        if (content && typeof content === 'object') {
+            if (content.code) {
+                return content.code;
+            }
+            if (content.content) {
+                return content.content;
+            }
         }
-        
-        // If on Windows, convert to CRLF
-        if (process.platform === 'win32') {
-            normalized = normalized.replace(/\n/g, '\r\n');
+
+        // If content is a string but looks like a code block, extract the code
+        if (typeof content === 'string' && content.includes('```')) {
+            const matches = content.match(/```(?:\w+)?\s*([\s\S]*?)```/);
+            if (matches && matches[1]) {
+                return matches[1].trim();
+            }
         }
-        
-        return normalized;
+
+        // If it's a plain string with escaped newlines, unescape them
+        if (typeof content === 'string' && content.includes('\\n')) {
+            try {
+                return JSON.parse(`"${content.replace(/"/g, '\\"')}"`);
+            } catch (e) {
+                console.warn('Failed to unescape content:', e);
+            }
+        }
+
+        // Return as is
+        return String(content);
     }
 
-    private formatCode(content: string): string {
-        const lines = content.split('\n');
-        let indentLevel = 0;
-        const indentSize = 4;
-        
-        return lines.map(line => {
-            const trimmedLine = line.trim();
-            
-            // Decrease indent for lines starting with closing brackets
-            if (trimmedLine.startsWith('}') || trimmedLine.startsWith(']') || trimmedLine.startsWith(')')) {
-                indentLevel = Math.max(0, indentLevel - 1);
+    private resolveFilePath(filePath: string): string {
+        // If the path doesn't have an extension and we're not explicitly creating a new file,
+        // try to find an existing file with that name
+        if (!path.extname(filePath)) {
+            const possibleExtensions = ['.go', '.js', '.ts', '.cpp', '.py', '.java'];
+            for (const ext of possibleExtensions) {
+                const fullPath = path.join(this.workspaceRoot!, `${filePath}${ext}`);
+                if (fs.existsSync(fullPath)) {
+                    return `${filePath}${ext}`;
+                }
             }
-            
-            // Special handling for else statements
-            if (trimmedLine.startsWith('else')) {
-                indentLevel = Math.max(0, indentLevel - 1);
-            }
-            
-            // Add indentation
-            const indentedLine = ' '.repeat(indentLevel * indentSize) + trimmedLine;
-            
-            // Increase indent for lines ending with opening brackets
-            if (trimmedLine.endsWith('{') || trimmedLine.endsWith('[') || 
-                (trimmedLine.includes('{') && !trimmedLine.includes('}'))) {
-                indentLevel++;
-            }
-            
-            return indentedLine;
-        }).join('\n');
+        }
+        return filePath;
     }
 
-    async createFile(filePath: string, content: string): Promise<void> {
+    async createFile(filePath: string, content: any): Promise<void> {
         try {
-            const sanitizedPath = this.validatePath(filePath);
+            console.log('=== Debug createFile input ===');
+            console.log('Original file path:', filePath);
+            console.log('Content type:', typeof content);
+
+            // Resolve the correct file path
+            const resolvedPath = this.resolveFilePath(filePath);
+            console.log('Resolved file path:', resolvedPath);
+
+            const sanitizedPath = this.validatePath(resolvedPath);
             const fullPath = path.join(this.workspaceRoot!, sanitizedPath);
             
             await this.validateFileOperation(fullPath, content);
 
             const directory = path.dirname(fullPath);
-
-            // Create directory if it doesn't exist
             await fs.promises.mkdir(directory, { recursive: true });
 
-            // Process and write file with proper formatting
-            const processedContent = this.normalizeLineEndings(content);
+            // Get the actual code content with proper formatting
+            const codeContent = this.getCodeContent(content);
+            
+            // Only normalize line endings
+            const processedContent = codeContent.replace(/\r\n|\r|\n/g, process.platform === 'win32' ? '\r\n' : '\n');
+            
+            console.log('=== Debug final content ===');
+            console.log('Final content:', processedContent);
+            console.log('Line count:', processedContent.split('\n').length);
+
             await vscode.workspace.fs.writeFile(
                 vscode.Uri.file(fullPath),
                 Buffer.from(processedContent, 'utf8')
@@ -193,13 +177,22 @@ export class FileManager {
 
             return;
         } catch (error) {
+            console.error('Create file error:', error);
             throw new Error(`Failed to create file: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
 
-    async updateFile(filePath: string, content: string): Promise<void> {
+    async updateFile(filePath: string, content: any): Promise<void> {
         try {
-            const sanitizedPath = this.validatePath(filePath);
+            console.log('=== Debug updateFile input ===');
+            console.log('Original file path:', filePath);
+            console.log('Content type:', typeof content);
+
+            // Resolve the correct file path
+            const resolvedPath = this.resolveFilePath(filePath);
+            console.log('Resolved file path:', resolvedPath);
+
+            const sanitizedPath = this.validatePath(resolvedPath);
             const fullPath = path.join(this.workspaceRoot!, sanitizedPath);
             
             await this.validateFileOperation(fullPath, content);
@@ -222,8 +215,16 @@ export class FileManager {
             await fs.promises.copyFile(fullPath, backupPath);
 
             try {
-                // Process and write file with proper formatting
-                const processedContent = this.normalizeLineEndings(content);
+                // Get the actual code content with proper formatting
+                const codeContent = this.getCodeContent(content);
+                
+                // Only normalize line endings
+                const processedContent = codeContent.replace(/\r\n|\r|\n/g, process.platform === 'win32' ? '\r\n' : '\n');
+                
+                console.log('=== Debug final content ===');
+                console.log('Final content:', processedContent);
+                console.log('Line count:', processedContent.split('\n').length);
+
                 await vscode.workspace.fs.writeFile(
                     vscode.Uri.file(fullPath),
                     Buffer.from(processedContent, 'utf8')
@@ -243,6 +244,7 @@ export class FileManager {
 
             return;
         } catch (error) {
+            console.error('Update file error:', error);
             throw new Error(`Failed to update file: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }

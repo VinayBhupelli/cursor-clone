@@ -69,7 +69,7 @@ export function clearConversationHistory() {
     conversationHistory = [];
 }
 
-export async function askAI(prompt: string, context: string, modelName: ModelName = MODELS.FLASH): Promise<string> {
+export async function askAI(prompt: string, context: string, modelName: ModelName = MODELS.FLASH): Promise<any> {
     try {
         if (!prompt.trim()) {
             return "Please provide a valid prompt.";
@@ -107,26 +107,98 @@ export async function askAI(prompt: string, context: string, modelName: ModelNam
         // Generate content
         const result = await model.generateContent(fullPrompt);
         const response = await result.response;
+        
+        // Parse the response to preserve code blocks
         const responseText = response.text();
+        const blocks = [];
+        let currentText = '';
+        let lines = responseText.split('\n');
+        let inCodeBlock = false;
+        let currentBlock: any = {};
+        let blockStartLine = '';
+
+        for (let line of lines) {
+            if (line.trim().startsWith('```')) {
+                if (inCodeBlock) {
+                    // End of code block
+                    inCodeBlock = false;
+                    if (currentBlock.code) {
+                        // Clean up the code block
+                        currentBlock.code = currentBlock.code.trim() + '\n';
+                        // Parse language and file info from the opening line
+                        const langAndFile = blockStartLine.slice(3).trim();
+                        const fileMatch = langAndFile.match(/{file:\s*([^}]+)}/);
+                        if (fileMatch) {
+                            currentBlock.file = fileMatch[1].trim();
+                            currentBlock.language = langAndFile.slice(0, langAndFile.indexOf('{')).trim();
+                        } else {
+                            currentBlock.language = langAndFile;
+                        }
+                        blocks.push(currentBlock);
+                    }
+                    currentBlock = {};
+                    blockStartLine = '';
+                } else {
+                    // Start of code block
+                    if (currentText.trim()) {
+                        blocks.push({
+                            type: 'text',
+                            content: currentText.trim()
+                        });
+                        currentText = '';
+                    }
+                    inCodeBlock = true;
+                    blockStartLine = line;
+                    currentBlock = {
+                        type: 'code',
+                        code: ''
+                    };
+                }
+            } else if (inCodeBlock) {
+                // Inside code block - preserve all whitespace and line breaks
+                currentBlock.code = (currentBlock.code || '') + line + '\n';
+            } else {
+                currentText += line + '\n';
+            }
+        }
+
+        // Add any remaining text
+        if (currentText.trim()) {
+            blocks.push({
+                type: 'text',
+                content: currentText.trim()
+            });
+        }
+
+        // Clean up code blocks and ensure proper line endings
+        blocks.forEach(block => {
+            if (block.type === 'code' && block.code) {
+                // Normalize line endings and ensure trailing newline
+                block.code = block.code.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                if (!block.code.endsWith('\n')) {
+                    block.code += '\n';
+                }
+            }
+        });
 
         // Add assistant response to history
         conversationHistory.push({ role: 'assistant', content: responseText });
 
-        return responseText;
+        return blocks;
     } catch (error) {
         console.error('Error in askAI:', error);
         
         if (error instanceof Error) {
             if (error.message.includes('API key')) {
-                return "Error: Invalid API key configuration. Please check your API key.";
+                return [{ type: 'text', content: "Error: Invalid API key configuration. Please check your API key." }];
             }
             if (error.message.includes('not found') || error.message.includes('deprecated')) {
-                return "Error: The selected model is not available. Please try again later.";
+                return [{ type: 'text', content: "Error: The selected model is not available. Please try again later." }];
             }
-            return `Error: ${error.message}`;
+            return [{ type: 'text', content: `Error: ${error.message}` }];
         }
         
-        return "Error: An unexpected error occurred.";
+        return [{ type: 'text', content: "Error: An unexpected error occurred." }];
     }
 }
 
