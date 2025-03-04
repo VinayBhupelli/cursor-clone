@@ -1,140 +1,139 @@
 import * as vscode from "vscode";
-import * as fs from "fs";
-import * as path from "path";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import * as dotenv from "dotenv";
-
-dotenv.config(); // Load environment variables
-
-const GEMINI_API_KEY = "AIzaSyC2TMwG7ewvLrzZoNG5IKs12KOET26lrbA";
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+import { askAI } from "./api";
+import { modifyFile } from "./fileManager";
+import { ContextManager } from "./contextManager";
+import { Uri } from "vscode";
+import * as path from 'path';
 
 export function activate(context: vscode.ExtensionContext) {
-  vscode.window.showInformationMessage("Chat Cursor Extension Activated! 🚀");
+    let chatPanel: vscode.WebviewPanel | undefined;
+    const contextManager = new ContextManager();
 
-  // ✅ AI Code Generation Command
-  let generateCodeCommand = vscode.commands.registerCommand("chatCursor.generateCode", async () => {
-    const userQuery = await vscode.window.showInputBox({ prompt: "Describe the code you need" });
-    if (!userQuery) return;
+    let disposable = vscode.commands.registerCommand("chatCursor.showSidebar", async () => {
+        if (chatPanel) {
+            chatPanel.reveal(vscode.ViewColumn.Beside);
+            return;
+        }
 
-    vscode.window.showInformationMessage("Generating AI-powered code...");
+        chatPanel = vscode.window.createWebviewPanel(
+            "aiChat",
+            "AI Chat",
+            vscode.ViewColumn.Beside,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true,
+                localResourceRoots: [
+                    Uri.file(path.join(context.extensionPath, 'frontend'))
+                ]
+            }
+        );
 
-    try {
-      const prompt = `${userQuery}\n\nReturn the code first, followed by a line of ******, then explain the code below it. in simple format`;
-      const result = await model.generateContent(prompt);
-      let response = result.response.text();
+        const workspaceFiles = await contextManager.loadWorkspaceFiles();
+        chatPanel.webview.html = getWebviewContent(context, chatPanel);
 
-      if (!response) throw new Error("No response from Gemini API");
+        chatPanel.webview.onDidReceiveMessage(async (message) => {
+            try {
+                if (message.command === "ask") {
+                    const response = await askAI(
+                        message.text, 
+                        JSON.stringify(workspaceFiles),
+                        message.model // Pass the selected model
+                    );
 
-      // Split response into code and details
-      let parts = response.split("******");
-      if (parts.length < 2) throw new Error("AI response format incorrect");
+                    if (message.text.startsWith("@")) {
+                        const [fileName, ...changes] = message.text.split(" ");
+                        await modifyFile(fileName.slice(1), changes.join(" "));
+                    }
 
-      let code = parts[0].trim().split("\n").slice(1, -1).join("\n"); // Remove first & last line
-      let details = parts[1].trim().split("\n").map((line) => `// ${line}`).join("\n"); // Convert details to comments
+                    chatPanel?.webview.postMessage({ command: "response", text: response });
+                }
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+                chatPanel?.webview.postMessage({ 
+                    command: "response", 
+                    text: `Error: ${errorMessage}`
+                });
+            }
+        });
 
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) {
-        vscode.window.showErrorMessage("No file open to insert code.");
-        return;
-      }
+        chatPanel.onDidDispose(() => {
+            chatPanel = undefined;
+        });
+    });
 
-      const edit = new vscode.WorkspaceEdit();
-      edit.insert(editor.document.uri, editor.selection.active, `\n${code}\n${details}\n`);
-      await vscode.workspace.applyEdit(edit);
+    context.subscriptions.push(disposable);
+}
 
-      vscode.window.showInformationMessage("AI-generated code inserted successfully!");
-    } catch (error: any) {
-      vscode.window.showErrorMessage(`Failed to generate code: ${error.message}`);
-      console.error(error);
-    }
-  });
-  
+function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.WebviewPanel): string {
+    const scriptUri = panel.webview.asWebviewUri(
+        Uri.file(path.join(context.extensionPath, 'frontend', 'sidebar.js'))
+    );
 
-  // ✅ AI Code Update Command
-  let updateCodeCommand = vscode.commands.registerCommand("chatCursor.updateCode", async () => {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-      vscode.window.showErrorMessage("No file open.");
-      return;
-    }
+    const styleUri = panel.webview.asWebviewUri(
+        Uri.file(path.join(context.extensionPath, 'frontend', 'styles.css'))
+    );
 
-    const selectedText = editor.document.getText(editor.selection);
-    if (!selectedText) {
-      vscode.window.showErrorMessage("Select some code to update.");
-      return;
-    }
-
-    vscode.window.showInformationMessage("Updating selected code using AI...");
-
-    try {
-      const prompt = `Improve the following code and provide a better version:\n\n${selectedText}`;
-      const result = await model.generateContent(prompt);
-      const updatedCode = result.response.text();
-
-      if (!updatedCode) throw new Error("No response from Gemini API");
-
-      const edit = new vscode.WorkspaceEdit();
-      edit.replace(editor.document.uri, editor.selection, updatedCode);
-      await vscode.workspace.applyEdit(edit);
-
-      vscode.window.showInformationMessage("Code updated successfully!");
-    } catch (error: any) {
-      vscode.window.showErrorMessage(`Failed to update code: ${error.message}`);
-      console.error(error);
-    }
-  });
-
-  // ✅ Create File Command
-  let createFileCommand = vscode.commands.registerCommand("chatCursor.createFile", async () => {
-    const fileName = await vscode.window.showInputBox({ prompt: "Enter the new file name (with extension)" });
-    if (!fileName) return;
-
-    const folderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!folderPath) {
-      vscode.window.showErrorMessage("No folder is open.");
-      return;
-    }
-
-    const filePath = path.join(folderPath, fileName);
-    if (fs.existsSync(filePath)) {
-      vscode.window.showErrorMessage("File already exists.");
-      return;
-    }
-
-    fs.writeFileSync(filePath, "// New file created by Chat Cursor\n");
-    vscode.window.showInformationMessage(`File created: ${fileName}`);
-
-    vscode.workspace.openTextDocument(filePath).then((doc) => vscode.window.showTextDocument(doc));
-  });
-
-  // ✅ Delete File Command
-  let deleteFileCommand = vscode.commands.registerCommand("chatCursor.deleteFile", async () => {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-      vscode.window.showErrorMessage("No file open.");
-      return;
-    }
-
-    const filePath = editor.document.uri.fsPath;
-    try {
-      fs.unlinkSync(filePath);
-      vscode.window.showInformationMessage("File deleted successfully!");
-
-      vscode.commands.executeCommand("workbench.action.closeActiveEditor");
-    } catch (error: any) {
-      vscode.window.showErrorMessage(`Failed to delete file: ${error.message}`);
-    }
-  });
-
-  // ✅ Register Commands
-  context.subscriptions.push(generateCodeCommand);
-  context.subscriptions.push(updateCodeCommand);
-  context.subscriptions.push(createFileCommand);
-  context.subscriptions.push(deleteFileCommand);
+    return `<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>AI Chat</title>
+        <link rel="stylesheet" href="${styleUri}">
+        <style>
+            #model-selector-container {
+                padding: 8px;
+                background: var(--vscode-editor-background);
+                border-bottom: 1px solid var(--vscode-panel-border);
+                position: sticky;
+                top: 0;
+                z-index: 100;
+            }
+            #model-selector {
+                width: 100%;
+                padding: 4px 8px;
+                background: var(--vscode-dropdown-background);
+                color: var(--vscode-dropdown-foreground);
+                border: 1px solid var(--vscode-dropdown-border);
+                border-radius: 2px;
+                outline: none;
+                cursor: pointer;
+            }
+            #model-selector:focus {
+                border-color: var(--vscode-focusBorder);
+            }
+            #chat-container {
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+            }
+            #chat-messages {
+                flex: 1;
+                overflow-y: auto;
+                padding: 16px;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="chat-container">
+            <div id="model-selector-container">
+                <select id="model-selector">
+                    <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                    <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite</option>
+                    <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
+                </select>
+            </div>
+            <div id="chat-messages"></div>
+            <div class="input-container">
+                <input type="text" id="chat-input" placeholder="Ask AI..." />
+                <button id="send-btn">Send</button>
+            </div>
+        </div>
+        <script src="${scriptUri}"></script>
+    </body>
+    </html>`;
 }
 
 export function deactivate() {
-  vscode.window.showInformationMessage("Chat Cursor Extension Deactivated.");
+    console.log("Chat Cursor extension is deactivated.");
 }
