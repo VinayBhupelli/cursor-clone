@@ -1,0 +1,12 @@
+{
+	"compilerOptions": {
+	  "moduleResolution": "node",
+	  "resolveJsonModule": true,
+	  "outDir": "./out",
+	  "rootDir": "./src",
+	  "lib": ["ESNext", "DOM"],
+	  "strict": true,
+	  "esModuleInterop": true
+	}
+  }
+  
