@@ -291,23 +291,40 @@ export class FileManager {
 
     async getFileSuggestions(query: string): Promise<string[]> {
         try {
-            if (!this.workspaceRoot || !query.trim()) {
+            if (!this.workspaceRoot) {
                 return [];
             }
 
             const files = await this.getAllFiles(this.workspaceRoot);
+            
+            // If query is empty or just @, return all files
+            if (!query || query === '@') {
+                return files.slice(0, 10); // Limit to 10 files
+            }
+
+            // Filter and sort files
             return files
-                .filter(file => file.toLowerCase().includes(query.toLowerCase()))
+                .filter(file => {
+                    const fileName = path.basename(file).toLowerCase();
+                    const queryLower = query.toLowerCase();
+                    return fileName.includes(queryLower) || file.toLowerCase().includes(queryLower);
+                })
                 .sort((a, b) => {
-                    // Prioritize exact matches and matches at start of filename
-                    const aLower = a.toLowerCase();
-                    const bLower = b.toLowerCase();
+                    const aName = path.basename(a).toLowerCase();
+                    const bName = path.basename(b).toLowerCase();
                     const queryLower = query.toLowerCase();
                     
-                    if (aLower === queryLower) return -1;
-                    if (bLower === queryLower) return 1;
-                    if (aLower.startsWith(queryLower)) return -1;
-                    if (bLower.startsWith(queryLower)) return 1;
+                    // Exact matches first
+                    if (aName === queryLower) return -1;
+                    if (bName === queryLower) return 1;
+                    
+                    // Then matches at start of filename
+                    if (aName.startsWith(queryLower)) return -1;
+                    if (bName.startsWith(queryLower)) return 1;
+                    
+                    // Then matches in path
+                    if (a.toLowerCase().includes(queryLower)) return -1;
+                    if (b.toLowerCase().includes(queryLower)) return 1;
                     
                     return a.localeCompare(b);
                 })

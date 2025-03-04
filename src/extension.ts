@@ -129,32 +129,35 @@ export function activate(context: vscode.ExtensionContext) {
 
                     case "applyCode":
                         if (message.code) {
-                            // Extract code from code block if present
-                            let codeToApply = message.code;
-                            
-                            // First try to extract code from markdown code block
-                            const codeBlockMatch = message.code.match(/```(?:\w+)?\s*(?:{[^}]*})?\s*([\s\S]*?)```/);
-                            if (codeBlockMatch) {
-                                codeToApply = codeBlockMatch[1];
-                            }
-
-                            // Preserve line breaks and formatting
-                            // 1. Convert escaped newlines to real newlines
-                            codeToApply = codeToApply.replace(/\\n/g, '\n');
-                            
-                            // 2. Normalize line endings
-                            codeToApply = codeToApply.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                            
-                            // 3. Remove any extra blank lines at start/end but preserve internal formatting
-                            codeToApply = codeToApply.replace(/^\s+|\s+$/g, '') + '\n';
-
-                            // 4. Preserve indentation
-                            codeToApply = codeToApply.split('\n').map((line: string) => {
-                                // Preserve existing indentation but trim trailing spaces
-                                return line.replace(/\s+$/, '');
-                            }).join('\n');
-
                             try {
+                                // Extract code from code block if present
+                                let codeToApply = message.code;
+                                
+                                // First try to extract code from markdown code block
+                                const codeBlockMatch = message.code.match(/```(?:\w+)?\s*(?:{[^}]*})?\s*([\s\S]*?)```/);
+                                if (codeBlockMatch) {
+                                    codeToApply = codeBlockMatch[1];
+                                }
+
+                                // Preserve formatting
+                                codeToApply = codeToApply
+                                    // 1. Convert escaped newlines to real newlines
+                                    .replace(/\\n/g, '\n')
+                                    // 2. Normalize line endings
+                                    .replace(/\r\n/g, '\n')
+                                    .replace(/\r/g, '\n')
+                                    // 3. Preserve indentation but remove trailing spaces
+                                    .split('\n')
+                                    .map((line: string) => line.replace(/\s+$/, ''))
+                                    .join('\n')
+                                    // 4. Ensure single newline at end
+                                    .trim() + '\n';
+
+                                // Log the processed code for debugging
+                                console.log('=== Processed Code ===');
+                                console.log(codeToApply);
+                                console.log('=== End Processed Code ===');
+
                                 if (!message.file) {
                                     // Create new file with the code
                                     const fileName = `generated_${Date.now()}.${getFileExtension(codeToApply)}`;
@@ -206,66 +209,199 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 async function handleFileCommand(text: string, fileManager: FileManager): Promise<string> {
-    // Format: @filename content
+    // Format: @filename [prompt]
     const parts = text.slice(1).split(' '); // Remove @ and split
     const fileName = parts[0];
-    const content = parts.slice(1).join(' ');
-
-    if (!content) {
-        // If no content provided, try to read the file
-        try {
-            const fileContent = await vscode.workspace.fs.readFile(
-                vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName))
-            );
-            return `Content of ${fileName}:\n\`\`\`\n${fileContent.toString()}\n\`\`\``;
-        } catch {
-            return `File ${fileName} does not exist. To create it, provide content after the filename.`;
+    const prompt = parts.slice(1).join(' ');
+    
+    // If no filename provided after @
+    if (!fileName) {
+        const suggestions = await fileManager.getFileSuggestions('');
+        if (suggestions.length === 0) {
+            return 'No files found in workspace';
         }
+        return `Available files:\n${suggestions.join('\n')}`;
     }
 
-    // Create or update the file
     try {
-        await fileManager.createFile(fileName, content);
-        return `Created/Updated file ${fileName}`;
-    } catch (error) {
-        try {
-            await fileManager.updateFile(fileName, content);
-            return `Updated file ${fileName}`;
-        } catch (updateError) {
-            throw new Error(`Failed to handle file operation: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        // Try to read the file first
+        const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
+        const fileContent = await vscode.workspace.fs.readFile(fileUri);
+        const existingContent = fileContent.toString();
+
+        // If no new prompt provided, show the current content
+        if (!prompt) {
+            const fileExt = path.extname(fileName).slice(1) || 'txt';
+            return `Content of ${fileName}:\n\`\`\`${fileExt}\n${existingContent}\n\`\`\``;
         }
+
+        // Send the prompt to Gemini with existing content as context
+        const response = await askAI(
+            prompt,
+            existingContent,
+            'gemini-2.0-flash'
+        );
+
+        // Extract code from the response
+        let content = '';
+        if (Array.isArray(response)) {
+            for (const block of response as ResponseBlock[]) {
+                if (block.type === 'code' && block.code) {
+                    content = block.code;
+                    break;
+                }
+            }
+        }
+
+        if (!content) {
+            return 'Failed to generate code from the prompt';
+        }
+
+        // Update file with generated content
+        await fileManager.updateFile(fileName, content);
+        return `Updated file ${fileName} with generated content`;
+    } catch (error) {
+        // If file doesn't exist and prompt is provided
+        if (prompt) {
+            // Send the prompt to Gemini to generate content
+            const response = await askAI(
+                prompt,
+                '', // No context needed for new file
+                'gemini-2.0-flash'
+            );
+
+            // Extract code from the response
+            let content = '';
+            if (Array.isArray(response)) {
+                for (const block of response as ResponseBlock[]) {
+                    if (block.type === 'code' && block.code) {
+                        content = block.code;
+                        break;
+                    }
+                }
+            }
+
+            if (!content) {
+                return 'Failed to generate code from the prompt';
+            }
+
+            // Create new file with generated content
+            await fileManager.createFile(fileName, content);
+            return `Created new file ${fileName} with generated content`;
+        }
+        return `File ${fileName} does not exist. Provide a prompt after the filename to create it.`;
     }
 }
 
 async function handleSlashCommand(text: string, fileManager: FileManager): Promise<string> {
     const [command, ...args] = text.slice(1).split(' ');
-    const fileName = args[0];
-    const content = args.slice(1).join(' ');
+    let fileName = args[0];
+    let prompt = args.slice(1).join(' ');
 
     switch (command.toLowerCase()) {
         case 'create':
             if (!fileName) {
                 return 'Please provide a filename: /create filename content';
             }
-            await fileManager.createFile(fileName, content || '');
-            return `Created file ${fileName}`;
+            try {
+                // Send the prompt to Gemini to generate content
+                const response = await askAI(
+                    prompt,
+                    '', // No context needed for new file
+                    'gemini-2.0-flash'
+                );
+
+                // Extract code from the response
+                let content = '';
+                if (Array.isArray(response)) {
+                    for (const block of response as ResponseBlock[]) {
+                        if (block.type === 'code' && block.code) {
+                            content = block.code;
+                            break;
+                        }
+                    }
+                }
+
+                if (!content) {
+                    return 'Failed to generate code from the prompt';
+                }
+
+                await fileManager.createFile(fileName, content);
+                return `Created file ${fileName} with generated content`;
+            } catch (error) {
+                throw new Error(`Failed to create file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
 
         case 'update':
             if (!fileName) {
                 return 'Please provide a filename: /update filename content';
             }
-            await fileManager.updateFile(fileName, content || '');
-            return `Updated file ${fileName}`;
+            try {
+                // If filename starts with @, remove it
+                fileName = fileName.startsWith('@') ? fileName.slice(1) : fileName;
+                
+                // Try to read existing content first
+                let existingContent = '';
+                try {
+                    const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
+                    const fileContent = await vscode.workspace.fs.readFile(fileUri);
+                    existingContent = fileContent.toString();
+                } catch (error) {
+                    return `File ${fileName} does not exist. Use /create to create a new file.`;
+                }
+
+                // If no new prompt provided, show existing content
+                if (!prompt) {
+                    const fileExt = path.extname(fileName).slice(1) || 'txt';
+                    return `Current content of ${fileName}:\n\`\`\`${fileExt}\n${existingContent}\n\`\`\`\nProvide a prompt to update the content.`;
+                }
+
+                // Send the prompt to Gemini with existing content as context
+                const response = await askAI(
+                    prompt,
+                    existingContent,
+                    'gemini-2.0-flash'
+                );
+
+                // Extract code from the response
+                let content = '';
+                if (Array.isArray(response)) {
+                    for (const block of response as ResponseBlock[]) {
+                        if (block.type === 'code' && block.code) {
+                            content = block.code;
+                            break;
+                        }
+                    }
+                }
+
+                if (!content) {
+                    return 'Failed to generate code from the prompt';
+                }
+
+                // Update file with generated content
+                await fileManager.updateFile(fileName, content);
+                return `Updated file ${fileName} with generated content`;
+            } catch (error) {
+                throw new Error(`Failed to update file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
 
         case 'delete':
             if (!fileName) {
                 return 'Please provide a filename: /delete filename';
             }
-            await fileManager.deleteFile(fileName);
-            return `Deleted file ${fileName}`;
+            try {
+                await fileManager.deleteFile(fileName);
+                return `Deleted file ${fileName}`;
+            } catch (error) {
+                throw new Error(`Failed to delete file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
 
         default:
-            return `Unknown command: ${command}. Available commands: /create, /update, /delete`;
+            return `Unknown command: ${command}. Available commands:\n` +
+                   `/create filename prompt - Create a new file with AI-generated content\n` +
+                   `/update @filename prompt - Update file with AI-generated content\n` +
+                   `/update @filename - Show current content\n` +
+                   `/delete filename - Delete a file`;
     }
 }
 
@@ -355,6 +491,21 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 padding: 16px;
                 background: var(--vscode-editor-background);
                 border-top: 1px solid var(--vscode-panel-border);
+                position: relative;
+            }
+            #command-hint {
+                position: absolute;
+                top: -30px;
+                left: 16px;
+                right: 16px;
+                padding: 4px 8px;
+                background: var(--vscode-editorHoverWidget-background);
+                border: 1px solid var(--vscode-editorHoverWidget-border);
+                border-radius: 2px;
+                font-size: 12px;
+                color: var(--vscode-editorHoverWidget-foreground);
+                display: none;
+                z-index: 1000;
             }
             #chat-input {
                 width: 100%;
@@ -370,53 +521,68 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 font-family: var(--vscode-editor-font-family);
                 font-size: var(--vscode-editor-font-size);
             }
-            .code-block {
-                position: relative;
-                margin: 8px 0;
+            #chat-input:focus {
+                border-color: var(--vscode-focusBorder);
+                outline: none;
             }
-            .code-block pre {
-                background: var(--vscode-editor-background);
-                padding: 12px;
-                border-radius: 4px;
-                overflow-x: auto;
+            #chat-input.command-mode {
+                border-color: var(--vscode-terminal-ansiGreen);
             }
-            .code-block .actions {
-                position: absolute;
-                top: 8px;
-                right: 8px;
-                display: flex;
-                gap: 8px;
-            }
-            .code-block button {
-                padding: 4px 8px;
-                background: var(--vscode-button-background);
-                color: var(--vscode-button-foreground);
-                border: none;
-                border-radius: 2px;
-                cursor: pointer;
-            }
-            .code-block button:hover {
-                background: var(--vscode-button-hoverBackground);
-            }
-            .file-suggestion {
-                padding: 4px 8px;
-                cursor: pointer;
-                border-radius: 2px;
-            }
-            .file-suggestion:hover {
-                background: var(--vscode-list-hoverBackground);
+            #chat-input.file-mode {
+                border-color: var(--vscode-terminal-ansiBlue);
             }
             #file-suggestions {
                 position: absolute;
                 bottom: 100%;
-                left: 0;
-                right: 0;
+                left: 16px;
+                right: 16px;
                 background: var(--vscode-dropdown-background);
                 border: 1px solid var(--vscode-dropdown-border);
                 border-radius: 2px;
                 max-height: 200px;
                 overflow-y: auto;
                 display: none;
+                z-index: 1000;
+            }
+            .file-suggestion {
+                padding: 8px 12px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .file-suggestion:hover {
+                background: var(--vscode-list-hoverBackground);
+            }
+            .file-suggestion.selected {
+                background: var(--vscode-list-activeSelectionBackground);
+                color: var(--vscode-list-activeSelectionForeground);
+            }
+            .file-suggestion-icon {
+                font-size: 14px;
+                color: var(--vscode-terminal-ansiBlue);
+            }
+            .input-actions {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+            }
+            #send-btn {
+                padding: 6px 12px;
+                background: var(--vscode-button-background);
+                color: var(--vscode-button-foreground);
+                border: none;
+                border-radius: 2px;
+                cursor: pointer;
+                font-size: 13px;
+            }
+            #send-btn:hover {
+                background: var(--vscode-button-hoverBackground);
+            }
+            .input-hint {
+                font-size: 12px;
+                color: var(--vscode-descriptionForeground);
+                margin-left: 8px;
             }
         </style>
     </head>
@@ -431,13 +597,19 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
             </div>
             <div id="chat-messages"></div>
             <div class="input-container">
+                <div id="command-hint"></div>
                 <div id="file-suggestions"></div>
                 <textarea
                     id="chat-input"
-                    placeholder="Ask AI... (Use @ to reference files, / for commands like /create, /update, /delete)"
+                    placeholder="Ask AI... (Use @ to reference files, / for commands)"
                     rows="3"
                 ></textarea>
-                <button id="send-btn">Send</button>
+                <div class="input-actions">
+                    <button id="send-btn">Send</button>
+                    <span class="input-hint">
+                        Commands: /create, /update, /delete • Files: Type @ to browse
+                    </span>
+                </div>
             </div>
         </div>
         <script src="${scriptUri}"></script>

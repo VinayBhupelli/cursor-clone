@@ -4,12 +4,22 @@ const vscode = acquireVsCodeApi();
 // Available models
 const AVAILABLE_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash'];
 
+// Command patterns
+const COMMANDS = {
+    CREATE: '/create',
+    UPDATE: '/update',
+    DELETE: '/delete'
+};
+
 // Initialize state
 let state = {
     messages: [],
-    selectedModel: 'gemini-2.0-flash',  // Default to flash model
+    selectedModel: 'gemini-2.0-flash',
     fileSuggestions: [],
-    showingSuggestions: false
+    showingSuggestions: false,
+    inputMode: 'normal', // 'normal', 'command', 'file'
+    currentCommand: null,
+    commandStep: 0
 };
 
 // Try to load previous state
@@ -20,7 +30,10 @@ if (previousState) {
         selectedModel: AVAILABLE_MODELS.includes(previousState.selectedModel) 
             ? previousState.selectedModel 
             : 'gemini-2.0-flash',
-        showingSuggestions: false
+        showingSuggestions: false,
+        inputMode: 'normal',
+        currentCommand: null,
+        commandStep: 0
     };
 }
 
@@ -30,6 +43,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const messagesContainer = document.getElementById('chat-messages');
     const modelSelector = document.getElementById('model-selector');
     const fileSuggestionsContainer = document.getElementById('file-suggestions');
+    const commandHint = document.getElementById('command-hint');
 
     // Set initial model selection
     if (state.selectedModel) {
@@ -46,32 +60,107 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Handle input changes for @ mentions and commands
+    // Handle input changes for commands and @ mentions
     chatInput.addEventListener('input', (e) => {
         const text = e.target.value;
         const cursorPosition = e.target.selectionStart;
         const textBeforeCursor = text.substring(0, cursorPosition);
         
+        // Reset command state if input is cleared
+        if (!text) {
+            resetCommandState();
+        }
+
+        // Handle commands
+        if (text.startsWith('/')) {
+            handleCommandInput(text);
+        }
         // Handle @ mentions
-        if (textBeforeCursor.includes('@')) {
-            const lastAtSymbol = textBeforeCursor.lastIndexOf('@');
-            const query = textBeforeCursor.substring(lastAtSymbol + 1);
-            
-            if (query) {
-                // Request file suggestions from extension
-                vscode.postMessage({
-                    command: 'getFileSuggestions',
-                    query: query
-                });
-            }
-        } else {
-            hideSuggestions();
+        else if (textBeforeCursor.includes('@')) {
+            handleFileMention(textBeforeCursor);
+        }
+        // Normal mode
+        else {
+            state.inputMode = 'normal';
+            state.currentCommand = null;
+            state.commandStep = 0;
+            updateCommandHint('');
         }
 
         // Auto-resize textarea
         chatInput.style.height = 'auto';
         chatInput.style.height = chatInput.scrollHeight + 'px';
     });
+
+    function handleCommandInput(text) {
+        state.inputMode = 'command';
+        const parts = text.split(' ');
+        const command = parts[0];
+
+        switch (command) {
+            case COMMANDS.CREATE:
+                if (parts.length === 1) {
+                    updateCommandHint('Enter filename (e.g., example.js)');
+                    state.commandStep = 1;
+                } else if (parts.length === 2) {
+                    updateCommandHint('Enter file content');
+                    state.commandStep = 2;
+                }
+                break;
+
+            case COMMANDS.UPDATE:
+                if (parts.length === 1) {
+                    updateCommandHint('Enter @filename or type @ to see available files');
+                    state.commandStep = 1;
+                } else if (parts[1].startsWith('@')) {
+                    handleFileMention(parts[1]);
+                    if (parts.length === 2) {
+                        updateCommandHint('Enter new content');
+                        state.commandStep = 2;
+                    }
+                }
+                break;
+
+            case COMMANDS.DELETE:
+                if (parts.length === 1) {
+                    updateCommandHint('Enter filename to delete');
+                    state.commandStep = 1;
+                }
+                break;
+
+            default:
+                updateCommandHint('Available commands: /create, /update, /delete');
+        }
+    }
+
+    function handleFileMention(textBeforeCursor) {
+        state.inputMode = 'file';
+        const lastAtSymbol = textBeforeCursor.lastIndexOf('@');
+        const query = textBeforeCursor.substring(lastAtSymbol + 1);
+        
+        // Always request suggestions when @ is typed
+        vscode.postMessage({
+            command: 'getFileSuggestions',
+            query: query || ''  // Send empty string to get all files if no query
+        });
+        
+        // Show suggestions container
+        fileSuggestionsContainer.style.display = 'block';
+        updateCommandHint('Select a file from the suggestions');
+    }
+
+    function updateCommandHint(hint) {
+        commandHint.textContent = hint;
+        commandHint.style.display = hint ? 'block' : 'none';
+    }
+
+    function resetCommandState() {
+        state.inputMode = 'normal';
+        state.currentCommand = null;
+        state.commandStep = 0;
+        updateCommandHint('');
+        hideSuggestions();
+    }
 
     // Handle key commands
     chatInput.addEventListener('keydown', (e) => {
@@ -88,6 +177,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (selected) {
                 insertFileSuggestion(selected.textContent);
             }
+        } else if (e.key === 'Escape') {
+            resetCommandState();
         }
     });
 
@@ -104,6 +195,7 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'response':
                 removeTypingIndicator();
                 addMessage('AI', message.text);
+                resetCommandState();
                 break;
             case 'fileSuggestions':
                 showFileSuggestions(message.suggestions);
@@ -116,16 +208,23 @@ function showFileSuggestions(suggestions) {
     const container = document.getElementById('file-suggestions');
     container.innerHTML = '';
     
-    suggestions.forEach(suggestion => {
+    if (suggestions.length === 0) {
         const div = document.createElement('div');
         div.className = 'file-suggestion';
-        div.textContent = suggestion;
-        div.onclick = () => insertFileSuggestion(suggestion);
+        div.textContent = 'No matching files';
         container.appendChild(div);
-    });
+    } else {
+        suggestions.forEach((suggestion, index) => {
+            const div = document.createElement('div');
+            div.className = 'file-suggestion' + (index === 0 ? ' selected' : '');
+            div.textContent = suggestion;
+            div.onclick = () => insertFileSuggestion(suggestion);
+            container.appendChild(div);
+        });
+    }
     
-    container.style.display = suggestions.length ? 'block' : 'none';
-    state.showingSuggestions = suggestions.length > 0;
+    container.style.display = 'block';
+    state.showingSuggestions = true;
 }
 
 function hideSuggestions() {
