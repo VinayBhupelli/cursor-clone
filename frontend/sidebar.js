@@ -199,24 +199,7 @@ function renderMessage(message) {
     content.innerHTML = formatMessage(message.text);
     
     // Add apply buttons to code blocks
-    content.querySelectorAll('.code-block').forEach(block => {
-        const actions = document.createElement('div');
-        actions.className = 'actions';
-        
-        const applyBtn = document.createElement('button');
-        applyBtn.textContent = 'Apply';
-        applyBtn.onclick = () => {
-            const code = block.querySelector('code').textContent;
-            vscode.postMessage({
-                command: 'applyCode',
-                code: code,
-                file: block.dataset.file
-            });
-        };
-        
-        actions.appendChild(applyBtn);
-        block.appendChild(actions);
-    });
+    content.querySelectorAll('.code-block').forEach(addApplyButton);
     
     messageElement.appendChild(header);
     messageElement.appendChild(content);
@@ -227,7 +210,9 @@ function formatMessage(text) {
     // Convert code blocks with file information
     text = text.replace(/```(\w+)?\s*(?:\{file:\s*([^}]+)\})?\n([\s\S]*?)```/g, (_, lang, file, code) => {
         const fileAttr = file ? `data-file="${escapeHtml(file)}"` : '';
-        return `<div class="code-block" ${fileAttr}><pre><code class="language-${lang || ''}">${escapeHtml(code.trim())}</code></pre></div>`;
+        const originalCode = code.trim();
+        // Store the original unformatted code in a data attribute
+        return `<div class="code-block" ${fileAttr}><pre><code class="language-${lang || ''}" data-original-code="${encodeURIComponent(originalCode)}">${escapeHtml(originalCode)}</code></pre></div>`;
     });
     
     // Convert inline code
@@ -279,4 +264,28 @@ function removeTypingIndicator() {
     if (indicator) {
         indicator.remove();
     }
+}
+
+// Add apply buttons to code blocks
+function addApplyButton(block) {
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    
+    const applyBtn = document.createElement('button');
+    applyBtn.textContent = 'Apply';
+    applyBtn.onclick = () => {
+        // Get the original code from the data attribute and decode it
+        const encodedCode = block.querySelector('code').getAttribute('data-original-code');
+        const code = encodedCode ? decodeURIComponent(encodedCode) : block.querySelector('code').textContent;
+        
+        // Send the original unformatted code
+        vscode.postMessage({
+            command: 'applyCode',
+            code: code,
+            file: block.dataset.file
+        });
+    };
+    
+    actions.appendChild(applyBtn);
+    block.appendChild(actions);
 }

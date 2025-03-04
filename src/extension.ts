@@ -131,15 +131,28 @@ export function activate(context: vscode.ExtensionContext) {
                         if (message.code) {
                             // Extract code from code block if present
                             let codeToApply = message.code;
+                            
+                            // First try to extract code from markdown code block
                             const codeBlockMatch = message.code.match(/```(?:\w+)?\s*(?:{[^}]*})?\s*([\s\S]*?)```/);
                             if (codeBlockMatch) {
-                                codeToApply = codeBlockMatch[1].trim();
-                                // Ensure proper line endings
-                                codeToApply = codeToApply.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                                if (!codeToApply.endsWith('\n')) {
-                                    codeToApply += '\n';
-                                }
+                                codeToApply = codeBlockMatch[1];
                             }
+
+                            // Preserve line breaks and formatting
+                            // 1. Convert escaped newlines to real newlines
+                            codeToApply = codeToApply.replace(/\\n/g, '\n');
+                            
+                            // 2. Normalize line endings
+                            codeToApply = codeToApply.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                            
+                            // 3. Remove any extra blank lines at start/end but preserve internal formatting
+                            codeToApply = codeToApply.replace(/^\s+|\s+$/g, '') + '\n';
+
+                            // 4. Preserve indentation
+                            codeToApply = codeToApply.split('\n').map((line: string) => {
+                                // Preserve existing indentation but trim trailing spaces
+                                return line.replace(/\s+$/, '');
+                            }).join('\n');
 
                             try {
                                 if (!message.file) {
