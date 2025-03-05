@@ -32,51 +32,62 @@ export function activate(context: vscode.ExtensionContext) {
         lastGeneratedContent.set(fileName, content);
     };
 
+    // Register view provider
+    const provider = new AIChatViewProvider(context.extensionUri, contextManager, fileManager, storeGeneratedContent);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('aiChatView', provider)
+    );
+
     let disposable = vscode.commands.registerCommand("chatCursor.showSidebar", async () => {
-        if (chatPanel) {
-            chatPanel.reveal(vscode.ViewColumn.Beside);
-            return;
-        }
+        // Focus the view container instead of creating a new panel
+        await vscode.commands.executeCommand('workbench.view.extension.ai-chat');
+    });
 
-        chatPanel = vscode.window.createWebviewPanel(
-            "aiChat",
-            "AI Chat",
-            vscode.ViewColumn.Beside,
-            {
-                enableScripts: true,
-                retainContextWhenHidden: true,
-                localResourceRoots: [
-                    Uri.file(path.join(context.extensionPath, 'frontend'))
-                ],
-                enableCommandUris: true
-            }
-        );
+    context.subscriptions.push(disposable);
+}
 
-        const workspaceFiles = await contextManager.loadWorkspaceFiles();
-        chatPanel.webview.html = getWebviewContent(context, chatPanel);
+class AIChatViewProvider implements vscode.WebviewViewProvider {
+    private _view?: vscode.WebviewView;
 
-        chatPanel.webview.onDidReceiveMessage(async (message) => {
+    constructor(
+        private readonly _extensionUri: vscode.Uri,
+        private readonly _contextManager: ContextManager,
+        private readonly _fileManager: FileManager,
+        private readonly _storeContent: (fileName: string, content: string) => void
+    ) {}
+
+    public async resolveWebviewView(
+        webviewView: vscode.WebviewView,
+        context: vscode.WebviewViewResolveContext,
+        _token: vscode.CancellationToken,
+    ) {
+        this._view = webviewView;
+
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [
+                this._extensionUri
+            ]
+        };
+
+        const workspaceFiles = await this._contextManager.loadWorkspaceFiles();
+        webviewView.webview.html = getWebviewContent(this._extensionUri, webviewView.webview);
+
+        webviewView.webview.onDidReceiveMessage(async (message) => {
             try {
                 switch (message.command) {
                     case "ask":
                         // Handle @ commands for file operations
                         if (message.text.startsWith('@')) {
-                            const response = await handleFileCommand(message.text, fileManager, storeGeneratedContent, chatPanel);
-                            chatPanel?.webview.postMessage({ command: "response", text: response });
+                            const response = await handleFileCommand(message.text, this._fileManager, this._storeContent);
+                            this._view?.webview.postMessage({ command: "response", text: response });
                             return;
                         }
                         
                         // Handle / commands
                         if (message.text.startsWith('/')) {
-                            const response = await handleSlashCommand(message.text, fileManager, storeGeneratedContent, chatPanel);
-                            chatPanel?.webview.postMessage({ command: "response", text: response });
-                            return;
-                        }
-
-                        // Handle natural language commands
-                        if (message.text.toLowerCase().includes('create') && message.text.toLowerCase().includes('file')) {
-                            const response = await handleCreateFileCommand(message.text, fileManager);
-                            chatPanel?.webview.postMessage({ command: "response", text: response });
+                            const response = await handleSlashCommand(message.text, this._fileManager, this._storeContent);
+                            this._view?.webview.postMessage({ command: "response", text: response });
                             return;
                         }
 
@@ -90,22 +101,21 @@ export function activate(context: vscode.ExtensionContext) {
                         for (const block of response as ResponseBlock[]) {
                             if (block.type === 'code') {
                                 if (block.file && block.code) {
-                                    // If code block has a file specified, create/update the file
                                     try {
-                                        await fileManager.updateFile(block.file, block.code);
-                                        chatPanel?.webview.postMessage({ 
+                                        await this._fileManager.updateFile(block.file, block.code);
+                                        this._view?.webview.postMessage({ 
                                             command: "response", 
                                             text: `Updated file: ${block.file}`
                                         });
                                     } catch (error) {
                                         try {
-                                            await fileManager.createFile(block.file, block.code);
-                                            chatPanel?.webview.postMessage({ 
+                                            await this._fileManager.createFile(block.file, block.code);
+                                            this._view?.webview.postMessage({ 
                                                 command: "response", 
                                                 text: `Created file: ${block.file}`
                                             });
                                         } catch (createError) {
-                                            chatPanel?.webview.postMessage({ 
+                                            this._view?.webview.postMessage({ 
                                                 command: "response", 
                                                 text: `Error handling file ${block.file}: ${error instanceof Error ? error.message : 'Unknown error'}`
                                             });
@@ -127,102 +137,32 @@ export function activate(context: vscode.ExtensionContext) {
                             return '';
                         }).join('\n\n');
 
-                        chatPanel?.webview.postMessage({ 
+                        this._view?.webview.postMessage({ 
                             command: "response", 
                             text: formattedResponse 
                         });
                         break;
 
                     case "getFileSuggestions":
-                        const suggestions = await fileManager.getFileSuggestions(message.query);
-                        chatPanel?.webview.postMessage({ 
+                        const suggestions = await this._fileManager.getFileSuggestions(message.query);
+                        this._view?.webview.postMessage({ 
                             command: "fileSuggestions", 
                             suggestions 
                         });
                         break;
-
-                    case "applyCode":
-                        if (message.code) {
-                            try {
-                                // Extract code from code block if present
-                                let codeToApply = message.code;
-                                
-                                // First try to extract code from markdown code block
-                                const codeBlockMatch = message.code.match(/```(?:\w+)?\s*(?:{[^}]*})?\s*([\s\S]*?)```/);
-                                if (codeBlockMatch) {
-                                    codeToApply = codeBlockMatch[1];
-                                }
-
-                                // Preserve formatting
-                                codeToApply = codeToApply
-                                    // 1. Convert escaped newlines to real newlines
-                                    .replace(/\\n/g, '\n')
-                                    // 2. Normalize line endings
-                                    .replace(/\r\n/g, '\n')
-                                    .replace(/\r/g, '\n')
-                                    // 3. Preserve indentation but remove trailing spaces
-                                    .split('\n')
-                                    .map((line: string) => line.replace(/\s+$/, ''))
-                                    .join('\n')
-                                    // 4. Ensure single newline at end
-                                    .trim() + '\n';
-
-                                // Log the processed code for debugging
-                                console.log('=== Processed Code ===');
-                                console.log(codeToApply);
-                                console.log('=== End Processed Code ===');
-
-                                if (!message.file) {
-                                    // Create new file with the code
-                                    const fileName = `generated_${Date.now()}.${getFileExtension(codeToApply)}`;
-                                    await fileManager.createFile(fileName, codeToApply);
-                                    chatPanel?.webview.postMessage({ 
-                                        command: "response", 
-                                        text: `Created new file: ${fileName}`
-                                    });
-                                } else {
-                                    // Try to update first, if fails then create
-                                    try {
-                                        await fileManager.updateFile(message.file, codeToApply);
-                                        chatPanel?.webview.postMessage({ 
-                                            command: "response", 
-                                            text: `Updated file: ${message.file}`
-                                        });
-                                    } catch (updateError) {
-                                        await fileManager.createFile(message.file, codeToApply);
-                                        chatPanel?.webview.postMessage({ 
-                                            command: "response", 
-                                            text: `Created file: ${message.file}`
-                                        });
-                                    }
-                                }
-                            } catch (error) {
-                                chatPanel?.webview.postMessage({ 
-                                    command: "response", 
-                                    text: `Error handling file operation: ${error instanceof Error ? error.message : 'Unknown error'}`
-                                });
-                            }
-                        }
-                        break;
                 }
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-                chatPanel?.webview.postMessage({ 
+                this._view?.webview.postMessage({ 
                     command: "response", 
                     text: `Error: ${errorMessage}`
                 });
             }
         });
-
-        chatPanel.onDidDispose(() => {
-            chatPanel = undefined;
-        });
-    });
-
-    context.subscriptions.push(disposable);
+    }
 }
 
-async function handleFileCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void, panel?: vscode.WebviewPanel): Promise<string> {
+async function handleFileCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
     // Format: @filename [prompt]
     const parts = text.slice(1).split(' '); // Remove @ and split
     const fileName = parts[0];
@@ -293,7 +233,7 @@ async function handleFileCommand(text: string, fileManager: FileManager, storeCo
     }
 }
 
-async function handleSlashCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void, panel?: vscode.WebviewPanel): Promise<string> {
+async function handleSlashCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
     const [command, ...args] = text.slice(1).split(' ');
     let fileName = args[0];
     let prompt = args.slice(1).join(' ');
@@ -465,13 +405,17 @@ async function handleCreateFileCommand(text: string, fileManager: FileManager): 
     return `Created file ${fileName} successfully${content ? ' with the specified content' : ''}`;
 }
 
-function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.WebviewPanel): string {
-    const scriptUri = panel.webview.asWebviewUri(
-        Uri.file(path.join(context.extensionPath, 'frontend', 'sidebar.js'))
+function getWebviewContent(extensionUri: vscode.Uri, webview: vscode.Webview): string {
+    const scriptUri = webview.asWebviewUri(
+        vscode.Uri.joinPath(extensionUri, 'frontend', 'sidebar.js')
     );
 
-    const styleUri = panel.webview.asWebviewUri(
-        Uri.file(path.join(context.extensionPath, 'frontend', 'styles.css'))
+    const styleUri = webview.asWebviewUri(
+        vscode.Uri.joinPath(extensionUri, 'frontend', 'styles.css')
+    );
+
+    const logoUri = webview.asWebviewUri(
+        vscode.Uri.joinPath(extensionUri, 'asset', 'ai.png')
     );
 
     return `<!DOCTYPE html>
@@ -511,228 +455,8 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
             #chat-messages {
                 flex: 1;
                 overflow-y: auto;
-                padding: 20px;
-                display: flex;
-                flex-direction: column;
-                gap: 20px;
-                font-family: var(--vscode-editor-font-family);
-                line-height: 1.6;
+                padding: 16px;
             }
-            .message {
-                display: flex;
-                gap: 16px;
-                padding: 12px 16px;
-                border-radius: 8px;
-                background: var(--vscode-editor-background);
-                border: 1px solid var(--vscode-panel-border);
-                animation: fadeIn 0.3s ease;
-                max-width: 90%;
-            }
-            .message.user {
-                margin-left: auto;
-                background: var(--vscode-button-background);
-                color: var(--vscode-button-foreground);
-                border: none;
-            }
-            .message.assistant {
-                margin-right: auto;
-                background: var(--vscode-editorWidget-background);
-            }
-            .message-avatar {
-                width: 32px;
-                height: 32px;
-                border-radius: 50%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 16px;
-                flex-shrink: 0;
-            }
-            .message.user .message-avatar {
-                background: var(--vscode-button-hoverBackground);
-                color: var(--vscode-button-foreground);
-            }
-            .message.assistant .message-avatar {
-                background: var(--vscode-activityBarBadge-background);
-                color: var(--vscode-activityBarBadge-foreground);
-            }
-            .message-content {
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
-                overflow-x: auto;
-                max-width: 100%;
-            }
-            .message-header {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                font-size: 12px;
-                color: var(--vscode-descriptionForeground);
-            }
-            .message-time {
-                font-size: 11px;
-                opacity: 0.7;
-            }
-            .message-text {
-                white-space: pre-wrap;
-                word-break: break-word;
-            }
-            .message-text p {
-                margin: 0 0 12px 0;
-            }
-            .message-text p:last-child {
-                margin-bottom: 0;
-            }
-            .code-block {
-                position: relative;
-                margin: 12px 0;
-                background: var(--vscode-editor-background);
-                border-radius: 6px;
-                border: 1px solid var(--vscode-panel-border);
-            }
-            .code-header {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 8px 12px;
-                background: var(--vscode-editorGroupHeader-tabsBackground);
-                border-bottom: 1px solid var(--vscode-panel-border);
-                border-radius: 6px 6px 0 0;
-                font-family: var(--vscode-font-family);
-                font-size: 12px;
-            }
-            .code-language {
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                color: var(--vscode-descriptionForeground);
-            }
-            .code-actions {
-                display: flex;
-                gap: 8px;
-            }
-            .code-action-button {
-                padding: 4px 8px;
-                font-size: 11px;
-                border-radius: 3px;
-                border: 1px solid var(--vscode-button-background);
-                background: transparent;
-                color: var(--vscode-button-background);
-                cursor: pointer;
-                transition: all 0.2s ease;
-            }
-            .code-action-button:hover {
-                background: var(--vscode-button-background);
-                color: var(--vscode-button-foreground);
-            }
-            .code-action-button.apply {
-                border-color: var(--vscode-terminal-ansiGreen);
-                color: var(--vscode-terminal-ansiGreen);
-            }
-            .code-action-button.apply:hover {
-                background: var(--vscode-terminal-ansiGreen);
-                color: var(--vscode-button-foreground);
-            }
-            .code-content {
-                padding: 12px;
-                overflow-x: auto;
-                font-family: var(--vscode-editor-font-family);
-                font-size: var(--vscode-editor-font-size);
-                line-height: 1.5;
-                tab-size: 4;
-            }
-            .code-content pre {
-                margin: 0;
-                white-space: pre;
-            }
-            .code-content code {
-                font-family: inherit;
-            }
-            .apply-button-container {
-                margin-top: 12px;
-                display: flex;
-                gap: 8px;
-            }
-            .apply-button {
-                padding: 6px 16px;
-                font-size: 12px;
-                border-radius: 4px;
-                background: var(--vscode-terminal-ansiGreen);
-                color: var(--vscode-button-foreground);
-                border: none;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                transition: all 0.2s ease;
-            }
-            .apply-button:hover {
-                filter: brightness(1.1);
-                transform: translateY(-1px);
-            }
-            .apply-button:active {
-                transform: translateY(0);
-            }
-            .copy-button {
-                padding: 6px 16px;
-                font-size: 12px;
-                border-radius: 4px;
-                background: var(--vscode-button-secondaryBackground);
-                color: var(--vscode-button-secondaryForeground);
-                border: none;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                transition: all 0.2s ease;
-            }
-            .copy-button:hover {
-                filter: brightness(1.1);
-                transform: translateY(-1px);
-            }
-            .inline-code {
-                padding: 2px 6px;
-                border-radius: 3px;
-                background: var(--vscode-textBlockQuote-background);
-                font-family: var(--vscode-editor-font-family);
-                font-size: 0.9em;
-            }
-            .message-divider {
-                display: flex;
-                align-items: center;
-                gap: 12px;
-                margin: 20px 0;
-                color: var(--vscode-descriptionForeground);
-                font-size: 12px;
-            }
-            .message-divider::before,
-            .message-divider::after {
-                content: "";
-                flex: 1;
-                height: 1px;
-                background: var(--vscode-panel-border);
-            }
-            @keyframes fadeIn {
-                from {
-                    opacity: 0;
-                    transform: translateY(10px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
-            }
-            /* Syntax highlighting */
-            .token.comment { color: var(--vscode-editor-foreground); opacity: 0.5; }
-            .token.keyword { color: var(--vscode-symbolIcon-keywordForeground); }
-            .token.string { color: var(--vscode-symbolIcon-stringForeground); }
-            .token.number { color: var(--vscode-symbolIcon-numberForeground); }
-            .token.function { color: var(--vscode-symbolIcon-functionForeground); }
-            .token.class-name { color: var(--vscode-symbolIcon-classForeground); }
-            .token.operator { color: var(--vscode-symbolIcon-operatorForeground); }
-            /* Keep existing input container styles below */
-            
             .input-container {
                 padding: 16px;
                 background: var(--vscode-editor-background);
@@ -742,12 +466,14 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 flex-direction: column;
                 gap: 8px;
             }
+
             .input-wrapper {
                 position: relative;
                 display: flex;
                 flex-direction: column;
                 gap: 4px;
             }
+
             .input-header {
                 display: flex;
                 align-items: center;
@@ -758,6 +484,7 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 border: 1px solid var(--vscode-input-border);
                 border-bottom: none;
             }
+
             .input-header-left {
                 display: flex;
                 align-items: center;
@@ -765,11 +492,13 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 font-size: 12px;
                 color: var(--vscode-descriptionForeground);
             }
+
             .input-header-right {
                 display: flex;
                 align-items: center;
                 gap: 4px;
             }
+
             .input-status {
                 font-size: 11px;
                 padding: 2px 6px;
@@ -777,6 +506,7 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 background: var(--vscode-badge-background);
                 color: var(--vscode-badge-foreground);
             }
+
             #chat-input {
                 width: 100%;
                 min-height: 100px;
@@ -792,17 +522,21 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 resize: vertical;
                 transition: all 0.2s ease;
             }
+
             #chat-input:focus {
                 border-color: var(--vscode-focusBorder);
                 outline: none;
                 box-shadow: 0 0 0 1px var(--vscode-focusBorder);
             }
+
             #chat-input.command-mode {
                 border-color: var(--vscode-terminal-ansiGreen);
             }
+
             #chat-input.file-mode {
                 border-color: var(--vscode-terminal-ansiBlue);
             }
+
             .input-footer {
                 display: flex;
                 align-items: center;
@@ -813,11 +547,13 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 border: 1px solid var(--vscode-input-border);
                 border-top: none;
             }
+
             .input-actions {
                 display: flex;
                 gap: 8px;
                 align-items: center;
             }
+
             #send-btn {
                 padding: 6px 16px;
                 background: var(--vscode-button-background);
@@ -832,13 +568,16 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 gap: 6px;
                 transition: all 0.2s ease;
             }
+
             #send-btn:hover {
                 background: var(--vscode-button-hoverBackground);
                 transform: translateY(-1px);
             }
+
             #send-btn:active {
                 transform: translateY(0);
             }
+
             .input-hint {
                 font-size: 12px;
                 color: var(--vscode-descriptionForeground);
@@ -846,10 +585,12 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 align-items: center;
                 gap: 12px;
             }
+
             .input-shortcuts {
                 display: flex;
                 gap: 8px;
             }
+
             .shortcut-item {
                 display: flex;
                 align-items: center;
@@ -860,6 +601,7 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 border-radius: 3px;
                 font-size: 11px;
             }
+
             .shortcut-key {
                 font-family: monospace;
                 font-size: 10px;
@@ -867,6 +609,7 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 background: var(--vscode-editor-background);
                 border-radius: 2px;
             }
+
             #file-suggestions {
                 position: absolute;
                 bottom: 100%;
@@ -881,6 +624,7 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 z-index: 1000;
                 box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
             }
+
             .file-suggestion {
                 padding: 8px 12px;
                 cursor: pointer;
@@ -889,17 +633,21 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 gap: 8px;
                 transition: background-color 0.2s;
             }
+
             .file-suggestion:hover {
                 background: var(--vscode-list-hoverBackground);
             }
+
             .file-suggestion.selected {
                 background: var(--vscode-list-activeSelectionBackground);
                 color: var(--vscode-list-activeSelectionForeground);
             }
+
             .file-suggestion-icon {
                 font-size: 14px;
                 color: var(--vscode-terminal-ansiBlue);
             }
+
             #command-hint {
                 position: absolute;
                 top: -30px;
@@ -915,20 +663,73 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
                 z-index: 1000;
                 box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
             }
+
+            .header-container {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 12px 16px;
+                background: var(--vscode-editor-background);
+                border-bottom: 1px solid var(--vscode-panel-border);
+                position: sticky;
+                top: 0;
+                z-index: 100;
+            }
+
+            .header-logo {
+                width: 24px;
+                height: 24px;
+                object-fit: contain;
+            }
+
+            .header-title {
+                font-size: 14px;
+                font-weight: 500;
+                color: var(--vscode-foreground);
+                flex: 1;
+            }
+
+            #model-selector-container {
+                flex: 1;
+                padding: 0;
+                background: transparent;
+                border: none;
+            }
+
+            #model-selector {
+                width: 100%;
+                padding: 4px 8px;
+                background: var(--vscode-dropdown-background);
+                color: var(--vscode-dropdown-foreground);
+                border: 1px solid var(--vscode-dropdown-border);
+                border-radius: 4px;
+                outline: none;
+                cursor: pointer;
+                font-size: 12px;
+            }
+
+            /* Update chat container to account for new header */
+            #chat-container {
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+                background: var(--vscode-editor-background);
+            }
         </style>
     </head>
     <body>
         <div id="chat-container">
-            <div id="model-selector-container">
-                <select id="model-selector">
-                    <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
-                    <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite</option>
-                    <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
-                </select>
+            <div class="header-container">
+                <div class="header-title">AI Chat Assistant</div>
+                <div id="model-selector-container">
+                    <select id="model-selector">
+                        <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                        <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite</option>
+                        <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
+                    </select>
+                </div>
             </div>
-            <div id="chat-messages">
-                <!-- Messages will be dynamically added here -->
-            </div>
+            <div id="chat-messages"></div>
             <div class="input-container">
                 <div id="command-hint"></div>
                 <div id="file-suggestions"></div>
@@ -973,86 +774,6 @@ function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.Webvi
             </div>
         </div>
         <script>
-            // Add message rendering function
-            function formatMessage(content, isUser = false) {
-                const messageDiv = document.createElement('div');
-                messageDiv.className = \`message \${isUser ? 'user' : 'assistant'}\`;
-                
-                const avatar = document.createElement('div');
-                avatar.className = 'message-avatar';
-                avatar.textContent = isUser ? '👤' : '🤖';
-                
-                const messageContent = document.createElement('div');
-                messageContent.className = 'message-content';
-                
-                const header = document.createElement('div');
-                header.className = 'message-header';
-                header.innerHTML = \`
-                    <span>\${isUser ? 'You' : 'Assistant'}</span>
-                    <span class="message-time">\${new Date().toLocaleTimeString()}</span>
-                \`;
-                
-                const text = document.createElement('div');
-                text.className = 'message-text';
-                
-                // Process code blocks
-                content = content.replace(/\`\`\`([\\w]*)(\\s*{[^}]*})?(\\n|\\s)([\\s\\S]*?)\`\`\`/g, (match, lang, meta, newline, code) => {
-                    const language = lang || 'plaintext';
-                    const fileMatch = meta?.match(/{file:\\s*([^}]+)}/);
-                    const fileName = fileMatch ? fileMatch[1].trim() : '';
-                    
-                    return \`
-                        <div class="code-block">
-                            <div class="code-header">
-                                <div class="code-language">
-                                    <span>\${language}</span>
-                                    \${fileName ? \`<span>• \${fileName}</span>\` : ''}
-                                </div>
-                                <div class="code-actions">
-                                    <button class="code-action-button" onclick="copyCode(this)">Copy</button>
-                                    \${fileName ? \`<button class="code-action-button apply" onclick="applyChanges('\${fileName}')">Apply</button>\` : ''}
-                                </div>
-                            </div>
-                            <div class="code-content">
-                                <pre><code class="\${language}">\${code.trim()}</code></pre>
-                            </div>
-                        </div>
-                    \`;
-                });
-                
-                // Process inline code
-                content = content.replace(/\`([^\`]+)\`/g, '<code class="inline-code">$1</code>');
-                
-                text.innerHTML = content;
-                
-                messageContent.appendChild(header);
-                messageContent.appendChild(text);
-                
-                messageDiv.appendChild(avatar);
-                messageDiv.appendChild(messageContent);
-                
-                return messageDiv;
-            }
-
-            // Add copy code function
-            function copyCode(button) {
-                const codeBlock = button.closest('.code-block');
-                const code = codeBlock.querySelector('code').textContent;
-                navigator.clipboard.writeText(code);
-                
-                const originalText = button.textContent;
-                button.textContent = 'Copied!';
-                button.style.backgroundColor = 'var(--vscode-terminal-ansiGreen)';
-                button.style.color = 'var(--vscode-button-foreground)';
-                
-                setTimeout(() => {
-                    button.textContent = originalText;
-                    button.style.backgroundColor = '';
-                    button.style.color = '';
-                }, 2000);
-            }
-
-            // Keep existing applyChanges function
             function applyChanges(fileName) {
                 vscode.postMessage({
                     command: 'ask',
