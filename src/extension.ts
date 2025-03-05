@@ -32,28 +32,31 @@ export function activate(context: vscode.ExtensionContext) {
         lastGeneratedContent.set(fileName, content);
     };
 
-    // Register view provider
-    const provider = new AIChatViewProvider(context.extensionUri, contextManager, fileManager, storeGeneratedContent);
+    // Create and register a new webview view provider
+    const provider = new ChatViewProvider(context.extensionUri, contextManager, fileManager, lastGeneratedContent, storeGeneratedContent);
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('aiChatView', provider)
+        vscode.window.registerWebviewViewProvider('chatCursor.chatView', provider)
     );
 
+    // Keep the command for backward compatibility and quick access
     let disposable = vscode.commands.registerCommand("chatCursor.showSidebar", async () => {
         // Focus the view container instead of creating a new panel
-        await vscode.commands.executeCommand('workbench.view.extension.ai-chat');
+        await vscode.commands.executeCommand('chatCursor.chatView.focus');
     });
 
     context.subscriptions.push(disposable);
 }
 
-class AIChatViewProvider implements vscode.WebviewViewProvider {
+// Add the ChatViewProvider class
+class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly _contextManager: ContextManager,
         private readonly _fileManager: FileManager,
-        private readonly _storeContent: (fileName: string, content: string) => void
+        private readonly _lastGeneratedContent: Map<string, string>,
+        private readonly _storeGeneratedContent: (fileName: string, content: string) => void
     ) {}
 
     public async resolveWebviewView(
@@ -79,14 +82,21 @@ class AIChatViewProvider implements vscode.WebviewViewProvider {
                     case "ask":
                         // Handle @ commands for file operations
                         if (message.text.startsWith('@')) {
-                            const response = await handleFileCommand(message.text, this._fileManager, this._storeContent);
+                            const response = await handleFileCommand(message.text, this._fileManager, this._storeGeneratedContent);
                             this._view?.webview.postMessage({ command: "response", text: response });
                             return;
                         }
                         
                         // Handle / commands
                         if (message.text.startsWith('/')) {
-                            const response = await handleSlashCommand(message.text, this._fileManager, this._storeContent);
+                            const response = await handleSlashCommand(message.text, this._fileManager, this._storeGeneratedContent);
+                            this._view?.webview.postMessage({ command: "response", text: response });
+                            return;
+                        }
+
+                        // Handle natural language commands
+                        if (message.text.toLowerCase().includes('create') && message.text.toLowerCase().includes('file')) {
+                            const response = await handleCreateFileCommand(message.text, this._fileManager);
                             this._view?.webview.postMessage({ command: "response", text: response });
                             return;
                         }
@@ -101,6 +111,7 @@ class AIChatViewProvider implements vscode.WebviewViewProvider {
                         for (const block of response as ResponseBlock[]) {
                             if (block.type === 'code') {
                                 if (block.file && block.code) {
+                                    // If code block has a file specified, create/update the file
                                     try {
                                         await this._fileManager.updateFile(block.file, block.code);
                                         this._view?.webview.postMessage({ 
@@ -162,249 +173,7 @@ class AIChatViewProvider implements vscode.WebviewViewProvider {
     }
 }
 
-async function handleFileCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
-    // Format: @filename [prompt]
-    const parts = text.slice(1).split(' '); // Remove @ and split
-    const fileName = parts[0];
-    const prompt = parts.slice(1).join(' ');
-    
-    // If no filename provided after @
-    if (!fileName) {
-        const suggestions = await fileManager.getFileSuggestions('');
-        if (suggestions.length === 0) {
-            return 'No files found in workspace';
-        }
-        return `Available files:\n${suggestions.join('\n')}`;
-    }
-
-    try {
-        // Try to read the file first
-        let existingContent = '';
-        try {
-            const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
-            const fileContent = await vscode.workspace.fs.readFile(fileUri);
-            existingContent = fileContent.toString();
-        } catch (error) {
-            // File doesn't exist, will create new
-        }
-
-        // If no new prompt provided, show the current content
-        if (!prompt) {
-            const fileExt = path.extname(fileName).slice(1) || 'txt';
-            return existingContent ? 
-                `Content of ${fileName}:\n\`\`\`${fileExt}\n${existingContent}\n\`\`\`` :
-                `File ${fileName} does not exist. Provide a prompt to create it.`;
-        }
-
-        // Send the prompt to Gemini
-        const response = await askAI(
-            prompt,
-            existingContent ? `Current file content:\n${existingContent}\n\nGenerate additional code to append.` : '',
-            'gemini-2.0-flash'
-        );
-
-        // Extract code from the response
-        let content = '';
-        if (Array.isArray(response)) {
-            for (const block of response as ResponseBlock[]) {
-                if (block.type === 'code' && block.code) {
-                    content = block.code;
-                    break;
-                }
-            }
-        }
-
-        if (!content) {
-            return 'Failed to generate code from the prompt';
-        }
-
-        // Store the content for later use
-        const finalContent = existingContent ? 
-            `${existingContent}\n\n/* New code */\n${content}` : 
-            content;
-        storeContent(fileName, finalContent);
-
-        // Show preview with both existing and new content
-        const fileExt = path.extname(fileName).slice(1) || 'txt';
-        return `${existingContent ? 'Current content:\n```' + fileExt + '\n' + existingContent + '\n```\n\n' : ''}Generated code to ${existingContent ? 'append' : 'create'}:\n\`\`\`${fileExt}\n${content}\n\`\`\`\n\n<div class="apply-button-container"><button class="apply-button" onclick="applyChanges('${fileName}')">Apply Changes</button></div>`;
-
-    } catch (error) {
-        return `Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
-    }
-}
-
-async function handleSlashCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
-    const [command, ...args] = text.slice(1).split(' ');
-    let fileName = args[0];
-    let prompt = args.slice(1).join(' ');
-
-    switch (command.toLowerCase()) {
-        case 'apply':
-            if (!fileName) {
-                return 'Please provide a filename: /apply filename';
-            }
-            try {
-                // Get the last generated content from memory
-                const lastContent = await vscode.commands.executeCommand<string>('chatCursor.getLastGeneratedContent', fileName);
-                if (!lastContent) {
-                    return 'No generated content found for this file. Generate content first using @ or /create or /update commands.';
-                }
-
-                // Check if file exists and handle accordingly
-                try {
-                    const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
-                    let fileExists = false;
-                    try {
-                        await vscode.workspace.fs.stat(fileUri);
-                        fileExists = true;
-                    } catch {
-                        fileExists = false;
-                    }
-
-                    if (fileExists) {
-                        // File exists, check if this is an append operation
-                        const isAppendOperation = lastContent.includes('/* New code */');
-                        if (isAppendOperation) {
-                            // Get only the new code part
-                            const newCodeParts = lastContent.split('/* New code */');
-                            if (newCodeParts.length > 1) {
-                                // Update with only the new code appended
-                                const existingContent = (await vscode.workspace.fs.readFile(fileUri)).toString();
-                                const newContent = existingContent + '\n\n/* New code */\n' + newCodeParts[1].trim();
-                                await fileManager.updateFile(fileName, newContent);
-                                return `Updated file ${fileName} with the new code appended`;
-                            }
-                        }
-                        // Not an append operation, just update the file
-                        await fileManager.updateFile(fileName, lastContent);
-                        return `Updated file ${fileName} with the generated content`;
-                    } else {
-                        // File doesn't exist, create it
-                        await fileManager.createFile(fileName, lastContent);
-                        return `Created file ${fileName} with the generated content`;
-                    }
-                } catch (error) {
-                    throw new Error(`Failed to handle file operation: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                }
-            } catch (error) {
-                throw new Error(`Failed to apply changes: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            }
-
-        case 'create':
-        case 'update':
-            if (!fileName) {
-                return `Please provide a filename: /${command} filename content`;
-            }
-
-            // If filename starts with @, remove it
-            fileName = fileName.startsWith('@') ? fileName.slice(1) : fileName;
-
-            // Try to read existing content first
-            let existingContent = '';
-            try {
-                const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
-                const fileContent = await vscode.workspace.fs.readFile(fileUri);
-                existingContent = fileContent.toString();
-            } catch (error) {
-                if (command === 'update') {
-                    return `File ${fileName} does not exist. Use /create to create a new file.`;
-                }
-            }
-
-            // If no new prompt provided, show existing content
-            if (!prompt) {
-                const fileExt = path.extname(fileName).slice(1) || 'txt';
-                return existingContent ? 
-                    `Current content of ${fileName}:\n\`\`\`${fileExt}\n${existingContent}\n\`\`\`\nProvide a prompt to update the content.` :
-                    'Please provide content to create the file.';
-            }
-
-            // Send the prompt to Gemini
-            const response = await askAI(
-                prompt,
-                existingContent ? `Current file content:\n${existingContent}\n\nGenerate additional code to append.` : '',
-                'gemini-2.0-flash'
-            );
-
-            // Extract code from the response
-            let content = '';
-            if (Array.isArray(response)) {
-                for (const block of response as ResponseBlock[]) {
-                    if (block.type === 'code' && block.code) {
-                        content = block.code;
-                        break;
-                    }
-                }
-            }
-
-            if (!content) {
-                return 'Failed to generate code from the prompt';
-            }
-
-            // Store the content for later use
-            const finalContent = existingContent && command === 'update' ? 
-                `${existingContent}\n\n/* New code */\n${content}` : 
-                content;
-            storeContent(fileName, finalContent);
-
-            // Show preview with both existing and new content
-            const fileExt = path.extname(fileName).slice(1) || 'txt';
-            return `${existingContent ? 'Current content:\n```' + fileExt + '\n' + existingContent + '\n```\n\n' : ''}Generated code to ${existingContent ? 'append' : 'create'}:\n\`\`\`${fileExt}\n${content}\n\`\`\`\n\n<div class="apply-button-container"><button class="apply-button" onclick="applyChanges('${fileName}')">Apply Changes</button></div>`;
-
-        case 'delete':
-            if (!fileName) {
-                return 'Please provide a filename: /delete filename';
-            }
-            try {
-                await fileManager.deleteFile(fileName);
-                return `Deleted file ${fileName}`;
-            } catch (error) {
-                throw new Error(`Failed to delete file: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            }
-
-        default:
-            return `Unknown command: ${command}. Available commands:\n` +
-                   `/create filename prompt - Create a new file with AI-generated content\n` +
-                   `/update @filename prompt - Update file with AI-generated content\n` +
-                   `/update @filename - Show current content\n` +
-                   `/delete filename - Delete a file`;
-    }
-}
-
-function getFileExtension(code: string): string {
-    if (code.includes('<!DOCTYPE html>') || code.includes('<html>')) return 'html';
-    if (code.includes('function') || code.includes('const') || code.includes('let')) return 'js';
-    if (code.includes('interface') || code.includes('type ') || code.includes('namespace')) return 'ts';
-    if (code.includes('class') && code.includes('public')) return 'java';
-    if (code.includes('#include')) return 'cpp';
-    return 'txt';
-}
-
-async function handleCreateFileCommand(text: string, fileManager: FileManager): Promise<string> {
-    // Simple natural language parsing for file creation
-    const words = text.split(' ');
-    const createIndex = words.findIndex(w => w.toLowerCase() === 'create');
-    const fileIndex = words.findIndex(w => w.toLowerCase() === 'file');
-    
-    if (createIndex === -1 || fileIndex === -1) {
-        return "Could not understand the file creation command. Please use format: 'create file filename with content'";
-    }
-
-    const fileName = words[Math.max(createIndex, fileIndex) + 1];
-    if (!fileName) {
-        return "Please specify a filename";
-    }
-
-    const contentIndex = words.findIndex(w => w.toLowerCase() === 'with');
-    let content = '';
-    if (contentIndex !== -1) {
-        content = words.slice(contentIndex + 1).join(' ');
-    }
-
-    await fileManager.createFile(fileName, content);
-    return `Created file ${fileName} successfully${content ? ' with the specified content' : ''}`;
-}
-
+// Update getWebviewContent to use WebviewView instead of WebviewPanel
 function getWebviewContent(extensionUri: vscode.Uri, webview: vscode.Webview): string {
     const scriptUri = webview.asWebviewUri(
         vscode.Uri.joinPath(extensionUri, 'frontend', 'sidebar.js')
@@ -720,6 +489,7 @@ function getWebviewContent(extensionUri: vscode.Uri, webview: vscode.Webview): s
     <body>
         <div id="chat-container">
             <div class="header-container">
+                <img src="${logoUri}" alt="AI Chat" class="header-logo">
                 <div class="header-title">AI Chat Assistant</div>
                 <div id="model-selector-container">
                     <select id="model-selector">
@@ -784,6 +554,249 @@ function getWebviewContent(extensionUri: vscode.Uri, webview: vscode.Webview): s
         <script src="${scriptUri}"></script>
     </body>
     </html>`;
+}
+
+async function handleFileCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
+    // Format: @filename [prompt]
+    const parts = text.slice(1).split(' '); // Remove @ and split
+    const fileName = parts[0];
+    const prompt = parts.slice(1).join(' ');
+    
+    // If no filename provided after @
+    if (!fileName) {
+        const suggestions = await fileManager.getFileSuggestions('');
+        if (suggestions.length === 0) {
+            return 'No files found in workspace';
+        }
+        return `Available files:\n${suggestions.join('\n')}`;
+    }
+
+    try {
+        // Try to read the file first
+        let existingContent = '';
+        try {
+            const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
+            const fileContent = await vscode.workspace.fs.readFile(fileUri);
+            existingContent = fileContent.toString();
+        } catch (error) {
+            // File doesn't exist, will create new
+        }
+
+        // If no new prompt provided, show the current content
+        if (!prompt) {
+            const fileExt = path.extname(fileName).slice(1) || 'txt';
+            return existingContent ? 
+                `Content of ${fileName}:\n\`\`\`${fileExt}\n${existingContent}\n\`\`\`` :
+                `File ${fileName} does not exist. Provide a prompt to create it.`;
+        }
+
+        // Send the prompt to Gemini
+        const response = await askAI(
+            prompt,
+            existingContent ? `Current file content:\n${existingContent}\n\nGenerate additional code to append.` : '',
+            'gemini-2.0-flash'
+        );
+
+        // Extract code from the response
+        let content = '';
+        if (Array.isArray(response)) {
+            for (const block of response as ResponseBlock[]) {
+                if (block.type === 'code' && block.code) {
+                    content = block.code;
+                    break;
+                }
+            }
+        }
+
+        if (!content) {
+            return 'Failed to generate code from the prompt';
+        }
+
+        // Store the content for later use
+        const finalContent = existingContent ? 
+            `${existingContent}\n\n/* New code */\n${content}` : 
+            content;
+        storeContent(fileName, finalContent);
+
+        // Show preview with both existing and new content
+        const fileExt = path.extname(fileName).slice(1) || 'txt';
+        return `${existingContent ? 'Current content:\n```' + fileExt + '\n' + existingContent + '\n```\n\n' : ''}Generated code to ${existingContent ? 'append' : 'create'}:\n\`\`\`${fileExt}\n${content}\n\`\`\`\n\n<div class="apply-button-container"><button class="apply-button" onclick="applyChanges('${fileName}')">Apply Changes</button></div>`;
+
+    } catch (error) {
+        return `Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
+    }
+}
+
+async function handleSlashCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
+    const [command, ...args] = text.slice(1).split(' ');
+    let fileName = args[0];
+    let prompt = args.slice(1).join(' ');
+
+    switch (command.toLowerCase()) {
+        case 'apply':
+            if (!fileName) {
+                return 'Please provide a filename: /apply filename';
+            }
+            try {
+                // Get the last generated content from memory
+                const lastContent = await vscode.commands.executeCommand<string>('chatCursor.getLastGeneratedContent', fileName);
+                if (!lastContent) {
+                    return 'No generated content found for this file. Generate content first using @ or /create or /update commands.';
+                }
+
+                // Check if file exists and handle accordingly
+                try {
+                    const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
+                    let fileExists = false;
+                    try {
+                        await vscode.workspace.fs.stat(fileUri);
+                        fileExists = true;
+                    } catch {
+                        fileExists = false;
+                    }
+
+                    if (fileExists) {
+                        // File exists, check if this is an append operation
+                        const isAppendOperation = lastContent.includes('/* New code */');
+                        if (isAppendOperation) {
+                            // Get only the new code part
+                            const newCodeParts = lastContent.split('/* New code */');
+                            if (newCodeParts.length > 1) {
+                                // Update with only the new code appended
+                                const existingContent = (await vscode.workspace.fs.readFile(fileUri)).toString();
+                                const newContent = existingContent + '\n\n/* New code */\n' + newCodeParts[1].trim();
+                                await fileManager.updateFile(fileName, newContent);
+                                return `Updated file ${fileName} with the new code appended`;
+                            }
+                        }
+                        // Not an append operation, just update the file
+                        await fileManager.updateFile(fileName, lastContent);
+                        return `Updated file ${fileName} with the generated content`;
+                    } else {
+                        // File doesn't exist, create it
+                        await fileManager.createFile(fileName, lastContent);
+                        return `Created file ${fileName} with the generated content`;
+                    }
+                } catch (error) {
+                    throw new Error(`Failed to handle file operation: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                }
+            } catch (error) {
+                throw new Error(`Failed to apply changes: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
+
+        case 'create':
+        case 'update':
+            if (!fileName) {
+                return `Please provide a filename: /${command} filename content`;
+            }
+
+            // If filename starts with @, remove it
+            fileName = fileName.startsWith('@') ? fileName.slice(1) : fileName;
+
+            // Try to read existing content first
+            let existingContent = '';
+            try {
+                const fileUri = vscode.Uri.file(path.join(fileManager.getWorkspaceRoot(), fileName));
+                const fileContent = await vscode.workspace.fs.readFile(fileUri);
+                existingContent = fileContent.toString();
+            } catch (error) {
+                if (command === 'update') {
+                    return `File ${fileName} does not exist. Use /create to create a new file.`;
+                }
+            }
+
+            // If no new prompt provided, show existing content
+            if (!prompt) {
+                const fileExt = path.extname(fileName).slice(1) || 'txt';
+                return existingContent ? 
+                    `Current content of ${fileName}:\n\`\`\`${fileExt}\n${existingContent}\n\`\`\`\nProvide a prompt to update the content.` :
+                    'Please provide content to create the file.';
+            }
+
+            // Send the prompt to Gemini
+            const response = await askAI(
+                prompt,
+                existingContent ? `Current file content:\n${existingContent}\n\nGenerate additional code to append.` : '',
+                'gemini-2.0-flash'
+            );
+
+            // Extract code from the response
+            let content = '';
+            if (Array.isArray(response)) {
+                for (const block of response as ResponseBlock[]) {
+                    if (block.type === 'code' && block.code) {
+                        content = block.code;
+                        break;
+                    }
+                }
+            }
+
+            if (!content) {
+                return 'Failed to generate code from the prompt';
+            }
+
+            // Store the content for later use
+            const finalContent = existingContent && command === 'update' ? 
+                `${existingContent}\n\n/* New code */\n${content}` : 
+                content;
+            storeContent(fileName, finalContent);
+
+            // Show preview with both existing and new content
+            const fileExt = path.extname(fileName).slice(1) || 'txt';
+            return `${existingContent ? 'Current content:\n```' + fileExt + '\n' + existingContent + '\n```\n\n' : ''}Generated code to ${existingContent ? 'append' : 'create'}:\n\`\`\`${fileExt}\n${content}\n\`\`\`\n\n<div class="apply-button-container"><button class="apply-button" onclick="applyChanges('${fileName}')">Apply Changes</button></div>`;
+
+        case 'delete':
+            if (!fileName) {
+                return 'Please provide a filename: /delete filename';
+            }
+            try {
+                await fileManager.deleteFile(fileName);
+                return `Deleted file ${fileName}`;
+            } catch (error) {
+                throw new Error(`Failed to delete file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
+
+        default:
+            return `Unknown command: ${command}. Available commands:\n` +
+                   `/create filename prompt - Create a new file with AI-generated content\n` +
+                   `/update @filename prompt - Update file with AI-generated content\n` +
+                   `/update @filename - Show current content\n` +
+                   `/delete filename - Delete a file`;
+    }
+}
+
+function getFileExtension(code: string): string {
+    if (code.includes('<!DOCTYPE html>') || code.includes('<html>')) return 'html';
+    if (code.includes('function') || code.includes('const') || code.includes('let')) return 'js';
+    if (code.includes('interface') || code.includes('type ') || code.includes('namespace')) return 'ts';
+    if (code.includes('class') && code.includes('public')) return 'java';
+    if (code.includes('#include')) return 'cpp';
+    return 'txt';
+}
+
+async function handleCreateFileCommand(text: string, fileManager: FileManager): Promise<string> {
+    // Simple natural language parsing for file creation
+    const words = text.split(' ');
+    const createIndex = words.findIndex(w => w.toLowerCase() === 'create');
+    const fileIndex = words.findIndex(w => w.toLowerCase() === 'file');
+    
+    if (createIndex === -1 || fileIndex === -1) {
+        return "Could not understand the file creation command. Please use format: 'create file filename with content'";
+    }
+
+    const fileName = words[Math.max(createIndex, fileIndex) + 1];
+    if (!fileName) {
+        return "Please specify a filename";
+    }
+
+    const contentIndex = words.findIndex(w => w.toLowerCase() === 'with');
+    let content = '';
+    if (contentIndex !== -1) {
+        content = words.slice(contentIndex + 1).join(' ');
+    }
+
+    await fileManager.createFile(fileName, content);
+    return `Created file ${fileName} successfully${content ? ' with the specified content' : ''}`;
 }
 
 export function deactivate() {

@@ -17,11 +17,30 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:chatCursor.showSidebar"
+    "onCommand:chatCursor.showSidebar",
+    "onView:chatCursor.chatView"
   ],
   "main": "./out/extension.js",
   "icon": "asset/ai.png",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "chatCursor",
+          "title": "AI Chat Assistant",
+          "icon": "asset/ai.png"
+        }
+      ]
+    },
+    "views": {
+      "chatCursor": [
+        {
+          "id": "chatCursor.chatView",
+          "name": "AI Chat",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "chatCursor.showSidebar",
@@ -31,35 +50,7 @@
           "dark": "asset/ai.png"
         }
       }
-    ],
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "ai-chat",
-          "title": "AI Chat",
-          "icon": "asset/ai.png"
-        }
-      ]
-    },
-    "views": {
-      "ai-chat": [
-        {
-          "id": "aiChatView",
-          "name": "AI Chat",
-          "type": "webview",
-          "icon": "asset/ai.png"
-        }
-      ]
-    },
-    "menus": {
-      "view/title": [
-        {
-          "command": "chatCursor.showSidebar",
-          "when": "view == aiChatView",
-          "group": "navigation"
-        }
-      ]
-    }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "tsc -p ./tsconfig.json",
