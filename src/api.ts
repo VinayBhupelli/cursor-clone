@@ -4,7 +4,7 @@ import { FileManager } from "./fileManager";
 
 dotenv.config();
 
-const API_KEY = "";
+const API_KEY = "AIzaSyC2TMwG7ewvLrzZoNG5IKs12KOET26lrbA";
 const genAI = new GoogleGenerativeAI(API_KEY);
 
 // Available models

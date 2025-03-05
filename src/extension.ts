@@ -32,62 +32,48 @@ export function activate(context: vscode.ExtensionContext) {
         lastGeneratedContent.set(fileName, content);
     };
 
-    // Register view provider
-    const provider = new AIChatViewProvider(context.extensionUri, contextManager, fileManager, storeGeneratedContent);
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('aiChatView', provider)
-    );
+    // Create and manage the webview panel
+    function createChatPanel(viewColumn: vscode.ViewColumn = vscode.ViewColumn.Beside): vscode.WebviewPanel {
+        const panel = vscode.window.createWebviewPanel(
+            "aiChat",
+            "AI Chat",
+            viewColumn,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true,
+                localResourceRoots: [
+                    Uri.file(path.join(context.extensionPath, 'frontend')),
+                    Uri.file(path.join(context.extensionPath, 'asset'))
+                ],
+                enableCommandUris: true
+            }
+        );
 
-    let disposable = vscode.commands.registerCommand("chatCursor.showSidebar", async () => {
-        // Focus the view container instead of creating a new panel
-        await vscode.commands.executeCommand('workbench.view.extension.ai-chat');
-    });
+        const workspaceFiles = contextManager.loadWorkspaceFiles();
+        panel.webview.html = getWebviewContent(context, panel);
 
-    context.subscriptions.push(disposable);
-}
-
-class AIChatViewProvider implements vscode.WebviewViewProvider {
-    private _view?: vscode.WebviewView;
-
-    constructor(
-        private readonly _extensionUri: vscode.Uri,
-        private readonly _contextManager: ContextManager,
-        private readonly _fileManager: FileManager,
-        private readonly _storeContent: (fileName: string, content: string) => void
-    ) {}
-
-    public async resolveWebviewView(
-        webviewView: vscode.WebviewView,
-        context: vscode.WebviewViewResolveContext,
-        _token: vscode.CancellationToken,
-    ) {
-        this._view = webviewView;
-
-        webviewView.webview.options = {
-            enableScripts: true,
-            localResourceRoots: [
-                this._extensionUri
-            ]
-        };
-
-        const workspaceFiles = await this._contextManager.loadWorkspaceFiles();
-        webviewView.webview.html = getWebviewContent(this._extensionUri, webviewView.webview);
-
-        webviewView.webview.onDidReceiveMessage(async (message) => {
+        panel.webview.onDidReceiveMessage(async (message) => {
             try {
                 switch (message.command) {
                     case "ask":
                         // Handle @ commands for file operations
                         if (message.text.startsWith('@')) {
-                            const response = await handleFileCommand(message.text, this._fileManager, this._storeContent);
-                            this._view?.webview.postMessage({ command: "response", text: response });
+                            const response = await handleFileCommand(message.text, fileManager, storeGeneratedContent, panel);
+                            panel?.webview.postMessage({ command: "response", text: response });
                             return;
                         }
                         
                         // Handle / commands
                         if (message.text.startsWith('/')) {
-                            const response = await handleSlashCommand(message.text, this._fileManager, this._storeContent);
-                            this._view?.webview.postMessage({ command: "response", text: response });
+                            const response = await handleSlashCommand(message.text, fileManager, storeGeneratedContent, panel);
+                            panel?.webview.postMessage({ command: "response", text: response });
+                            return;
+                        }
+
+                        // Handle natural language commands
+                        if (message.text.toLowerCase().includes('create') && message.text.toLowerCase().includes('file')) {
+                            const response = await handleCreateFileCommand(message.text, fileManager);
+                            panel?.webview.postMessage({ command: "response", text: response });
                             return;
                         }
 
@@ -101,21 +87,22 @@ class AIChatViewProvider implements vscode.WebviewViewProvider {
                         for (const block of response as ResponseBlock[]) {
                             if (block.type === 'code') {
                                 if (block.file && block.code) {
+                                    // If code block has a file specified, create/update the file
                                     try {
-                                        await this._fileManager.updateFile(block.file, block.code);
-                                        this._view?.webview.postMessage({ 
+                                        await fileManager.updateFile(block.file, block.code);
+                                        panel?.webview.postMessage({ 
                                             command: "response", 
                                             text: `Updated file: ${block.file}`
                                         });
                                     } catch (error) {
                                         try {
-                                            await this._fileManager.createFile(block.file, block.code);
-                                            this._view?.webview.postMessage({ 
+                                            await fileManager.createFile(block.file, block.code);
+                                            panel?.webview.postMessage({ 
                                                 command: "response", 
                                                 text: `Created file: ${block.file}`
                                             });
                                         } catch (createError) {
-                                            this._view?.webview.postMessage({ 
+                                            panel?.webview.postMessage({ 
                                                 command: "response", 
                                                 text: `Error handling file ${block.file}: ${error instanceof Error ? error.message : 'Unknown error'}`
                                             });
@@ -137,32 +124,287 @@ class AIChatViewProvider implements vscode.WebviewViewProvider {
                             return '';
                         }).join('\n\n');
 
-                        this._view?.webview.postMessage({ 
+                        panel?.webview.postMessage({ 
                             command: "response", 
                             text: formattedResponse 
                         });
                         break;
 
                     case "getFileSuggestions":
-                        const suggestions = await this._fileManager.getFileSuggestions(message.query);
-                        this._view?.webview.postMessage({ 
+                        const suggestions = await fileManager.getFileSuggestions(message.query);
+                        panel?.webview.postMessage({ 
                             command: "fileSuggestions", 
                             suggestions 
                         });
                         break;
+
+                    case "applyCode":
+                        if (message.code) {
+                            try {
+                                // Extract code from code block if present
+                                let codeToApply = message.code;
+                                
+                                // First try to extract code from markdown code block
+                                const codeBlockMatch = message.code.match(/```(?:\w+)?\s*(?:{[^}]*})?\s*([\s\S]*?)```/);
+                                if (codeBlockMatch) {
+                                    codeToApply = codeBlockMatch[1];
+                                }
+
+                                // Preserve formatting
+                                codeToApply = codeToApply
+                                    // 1. Convert escaped newlines to real newlines
+                                    .replace(/\\n/g, '\n')
+                                    // 2. Normalize line endings
+                                    .replace(/\r\n/g, '\n')
+                                    .replace(/\r/g, '\n')
+                                    // 3. Preserve indentation but remove trailing spaces
+                                    .split('\n')
+                                    .map((line: string) => line.replace(/\s+$/, ''))
+                                    .join('\n')
+                                    // 4. Ensure single newline at end
+                                    .trim() + '\n';
+
+                                // Log the processed code for debugging
+                                console.log('=== Processed Code ===');
+                                console.log(codeToApply);
+                                console.log('=== End Processed Code ===');
+
+                                if (!message.file) {
+                                    // Create new file with the code
+                                    const fileName = `generated_${Date.now()}.${getFileExtension(codeToApply)}`;
+                                    await fileManager.createFile(fileName, codeToApply);
+                                    panel?.webview.postMessage({ 
+                                        command: "response", 
+                                        text: `Created new file: ${fileName}`
+                                    });
+                                } else {
+                                    // Try to update first, if fails then create
+                                    try {
+                                        await fileManager.updateFile(message.file, codeToApply);
+                                        panel?.webview.postMessage({ 
+                                            command: "response", 
+                                            text: `Updated file: ${message.file}`
+                                        });
+                                    } catch (updateError) {
+                                        await fileManager.createFile(message.file, codeToApply);
+                                        panel?.webview.postMessage({ 
+                                            command: "response", 
+                                            text: `Created file: ${message.file}`
+                                        });
+                                    }
+                                }
+                            } catch (error) {
+                                panel?.webview.postMessage({ 
+                                    command: "response", 
+                                    text: `Error handling file operation: ${error instanceof Error ? error.message : 'Unknown error'}`
+                                });
+                            }
+                        }
+                        break;
                 }
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-                this._view?.webview.postMessage({ 
+                panel?.webview.postMessage({ 
                     command: "response", 
                     text: `Error: ${errorMessage}`
                 });
             }
         });
+
+        return panel;
     }
+
+    // Register view provider
+    const provider = vscode.window.registerWebviewViewProvider('aiChatView', {
+        resolveWebviewView(webviewView) {
+            webviewView.webview.options = {
+                enableScripts: true,
+                localResourceRoots: [
+                    Uri.file(path.join(context.extensionPath, 'frontend')),
+                    Uri.file(path.join(context.extensionPath, 'asset'))
+                ]
+            };
+            webviewView.webview.html = getWebviewContent(context, webviewView as any);
+
+            // Reuse the same message handler
+            webviewView.webview.onDidReceiveMessage(async (message) => {
+                try {
+                    switch (message.command) {
+                        case "ask":
+                            // Handle @ commands for file operations
+                            if (message.text.startsWith('@')) {
+                                const response = await handleFileCommand(message.text, fileManager, storeGeneratedContent, webviewView as any);
+                                webviewView.webview.postMessage({ command: "response", text: response });
+                                return;
+                            }
+                            
+                            // Handle / commands
+                            if (message.text.startsWith('/')) {
+                                const response = await handleSlashCommand(message.text, fileManager, storeGeneratedContent, webviewView as any);
+                                webviewView.webview.postMessage({ command: "response", text: response });
+                                return;
+                            }
+
+                            // Handle natural language commands
+                            if (message.text.toLowerCase().includes('create') && message.text.toLowerCase().includes('file')) {
+                                const response = await handleCreateFileCommand(message.text, fileManager);
+                                webviewView.webview.postMessage({ command: "response", text: response });
+                                return;
+                            }
+
+                            const response = await askAI(
+                                message.text, 
+                                JSON.stringify(contextManager.loadWorkspaceFiles()),
+                                message.model
+                            );
+
+                            // Process each block in the response
+                            for (const block of response as ResponseBlock[]) {
+                                if (block.type === 'code') {
+                                    if (block.file && block.code) {
+                                        // If code block has a file specified, create/update the file
+                                        try {
+                                            await fileManager.updateFile(block.file, block.code);
+                                            webviewView.webview.postMessage({ 
+                                                command: "response", 
+                                                text: `Updated file: ${block.file}`
+                                            });
+                                        } catch (error) {
+                                            try {
+                                                await fileManager.createFile(block.file, block.code);
+                                                webviewView.webview.postMessage({ 
+                                                    command: "response", 
+                                                    text: `Created file: ${block.file}`
+                                                });
+                                            } catch (createError) {
+                                                webviewView.webview.postMessage({ 
+                                                    command: "response", 
+                                                    text: `Error handling file ${block.file}: ${error instanceof Error ? error.message : 'Unknown error'}`
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Send the formatted response
+                            const formattedResponse = (response as ResponseBlock[]).map(block => {
+                                if (block.type === 'text' && block.content) {
+                                    return block.content;
+                                } else if (block.type === 'code') {
+                                    const fileInfo = block.file ? ` {file: ${block.file}}` : '';
+                                    const language = block.language || '';
+                                    return `\`\`\`${language}${fileInfo}\n${block.code || ''}\n\`\`\``;
+                                }
+                                return '';
+                            }).join('\n\n');
+
+                            webviewView.webview.postMessage({ 
+                                command: "response", 
+                                text: formattedResponse 
+                            });
+                            break;
+
+                        case "getFileSuggestions":
+                            const suggestions = await fileManager.getFileSuggestions(message.query);
+                            webviewView.webview.postMessage({ 
+                                command: "fileSuggestions", 
+                                suggestions 
+                            });
+                            break;
+
+                        case "applyCode":
+                            if (message.code) {
+                                try {
+                                    // Extract code from code block if present
+                                    let codeToApply = message.code;
+                                    
+                                    // First try to extract code from markdown code block
+                                    const codeBlockMatch = message.code.match(/```(?:\w+)?\s*(?:{[^}]*})?\s*([\s\S]*?)```/);
+                                    if (codeBlockMatch) {
+                                        codeToApply = codeBlockMatch[1];
+                                    }
+
+                                    // Preserve formatting
+                                    codeToApply = codeToApply
+                                        // 1. Convert escaped newlines to real newlines
+                                        .replace(/\\n/g, '\n')
+                                        // 2. Normalize line endings
+                                        .replace(/\r\n/g, '\n')
+                                        .replace(/\r/g, '\n')
+                                        // 3. Preserve indentation but remove trailing spaces
+                                        .split('\n')
+                                        .map((line: string) => line.replace(/\s+$/, ''))
+                                        .join('\n')
+                                        // 4. Ensure single newline at end
+                                        .trim() + '\n';
+
+                                    // Log the processed code for debugging
+                                    console.log('=== Processed Code ===');
+                                    console.log(codeToApply);
+                                    console.log('=== End Processed Code ===');
+
+                                    if (!message.file) {
+                                        // Create new file with the code
+                                        const fileName = `generated_${Date.now()}.${getFileExtension(codeToApply)}`;
+                                        await fileManager.createFile(fileName, codeToApply);
+                                        webviewView.webview.postMessage({ 
+                                            command: "response", 
+                                            text: `Created new file: ${fileName}`
+                                        });
+                                    } else {
+                                        // Try to update first, if fails then create
+                                        try {
+                                            await fileManager.updateFile(message.file, codeToApply);
+                                            webviewView.webview.postMessage({ 
+                                                command: "response", 
+                                                text: `Updated file: ${message.file}`
+                                            });
+                                        } catch (updateError) {
+                                            await fileManager.createFile(message.file, codeToApply);
+                                            webviewView.webview.postMessage({ 
+                                                command: "response", 
+                                                text: `Created file: ${message.file}`
+                                            });
+                                        }
+                                    }
+                                } catch (error) {
+                                    webviewView.webview.postMessage({ 
+                                        command: "response", 
+                                        text: `Error handling file operation: ${error instanceof Error ? error.message : 'Unknown error'}`
+                                    });
+                                }
+                            }
+                            break;
+                    }
+                } catch (error) {
+                    const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+                    webviewView.webview.postMessage({ 
+                        command: "response", 
+                        text: `Error: ${errorMessage}`
+                    });
+                }
+            });
+        }
+    });
+
+    // Register the sidebar command (preserves existing functionality)
+    let disposable = vscode.commands.registerCommand("chatCursor.showSidebar", async () => {
+        if (chatPanel) {
+            chatPanel.reveal(vscode.ViewColumn.Beside);
+            return;
+        }
+
+        chatPanel = createChatPanel();
+        chatPanel.onDidDispose(() => {
+            chatPanel = undefined;
+        });
+    });
+
+    context.subscriptions.push(provider, disposable, getLastContentCommand);
 }
 
-async function handleFileCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
+async function handleFileCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void, panel?: vscode.WebviewPanel): Promise<string> {
     // Format: @filename [prompt]
     const parts = text.slice(1).split(' '); // Remove @ and split
     const fileName = parts[0];
@@ -233,7 +475,7 @@ async function handleFileCommand(text: string, fileManager: FileManager, storeCo
     }
 }
 
-async function handleSlashCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void): Promise<string> {
+async function handleSlashCommand(text: string, fileManager: FileManager, storeContent: (fileName: string, content: string) => void, panel?: vscode.WebviewPanel): Promise<string> {
     const [command, ...args] = text.slice(1).split(' ');
     let fileName = args[0];
     let prompt = args.slice(1).join(' ');
@@ -405,17 +647,18 @@ async function handleCreateFileCommand(text: string, fileManager: FileManager): 
     return `Created file ${fileName} successfully${content ? ' with the specified content' : ''}`;
 }
 
-function getWebviewContent(extensionUri: vscode.Uri, webview: vscode.Webview): string {
-    const scriptUri = webview.asWebviewUri(
-        vscode.Uri.joinPath(extensionUri, 'frontend', 'sidebar.js')
+function getWebviewContent(context: vscode.ExtensionContext, panel: vscode.WebviewPanel): string {
+    const scriptUri = panel.webview.asWebviewUri(
+        Uri.file(path.join(context.extensionPath, 'frontend', 'sidebar.js'))
     );
 
-    const styleUri = webview.asWebviewUri(
-        vscode.Uri.joinPath(extensionUri, 'frontend', 'styles.css')
+    const styleUri = panel.webview.asWebviewUri(
+        Uri.file(path.join(context.extensionPath, 'frontend', 'styles.css'))
     );
 
-    const logoUri = webview.asWebviewUri(
-        vscode.Uri.joinPath(extensionUri, 'asset', 'ai.png')
+    // Add logo URI
+    const logoUri = panel.webview.asWebviewUri(
+        Uri.file(path.join(context.extensionPath, 'asset', 'ai.png'))
     );
 
     return `<!DOCTYPE html>
@@ -720,6 +963,7 @@ function getWebviewContent(extensionUri: vscode.Uri, webview: vscode.Webview): s
     <body>
         <div id="chat-container">
             <div class="header-container">
+                <img src="${logoUri}" alt="AI Chat" class="header-logo">
                 <div class="header-title">AI Chat Assistant</div>
                 <div id="model-selector-container">
                     <select id="model-selector">

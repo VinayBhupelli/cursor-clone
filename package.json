@@ -17,21 +17,12 @@
     "Other"
   ],
   "activationEvents": [
+    "onView:aiChatView",
     "onCommand:chatCursor.showSidebar"
   ],
   "main": "./out/extension.js",
   "icon": "asset/ai.png",
   "contributes": {
-    "commands": [
-      {
-        "command": "chatCursor.showSidebar",
-        "title": "Open AI Chat",
-        "icon": {
-          "light": "asset/ai.png",
-          "dark": "asset/ai.png"
-        }
-      }
-    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -46,20 +37,20 @@
         {
           "id": "aiChatView",
           "name": "AI Chat",
-          "type": "webview",
-          "icon": "asset/ai.png"
+          "type": "webview"
         }
       ]
     },
-    "menus": {
-      "view/title": [
-        {
-          "command": "chatCursor.showSidebar",
-          "when": "view == aiChatView",
-          "group": "navigation"
+    "commands": [
+      {
+        "command": "chatCursor.showSidebar",
+        "title": "Open AI Chat",
+        "icon": {
+          "light": "asset/ai.png",
+          "dark": "asset/ai.png"
         }
-      ]
-    }
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "tsc -p ./tsconfig.json",
